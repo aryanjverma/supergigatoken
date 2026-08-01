@@ -31,7 +31,7 @@ use crate::bindings::sources::{
     BytesSource, FileSource, JsonlFileSource, ParquetFileSource, TextFileSource,
     encode_files_ragged,
 };
-use crate::bindings::train::train_bpe;
+use crate::bindings::train::{train_bpe, train_superbpe};
 use crate::input::file_source::DocFormat;
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::prelude::*;
@@ -528,6 +528,7 @@ fn load_hf_json(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
 fn gigatoken_rs<'py>(py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add("SpecialTokenFound", py.get_type::<SpecialTokenFound>())?;
     m.add_function(wrap_pyfunction!(train_bpe, m)?)?;
+    m.add_function(wrap_pyfunction!(train_superbpe, m)?)?;
     m.add_class::<FileSource>()?;
     m.add_class::<TextFileSource>()?;
     m.add_class::<JsonlFileSource>()?;

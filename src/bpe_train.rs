@@ -1,3 +1,5 @@
+use crate::bpe::simple_bpe_merge;
+use crate::token::TokenId;
 use dashmap::DashMap;
 use indicatif::ProgressBar;
 use itertools::Itertools;
@@ -19,6 +21,9 @@ type Pair = (u32, u32);
 fn count_pairs(words: &[Word]) -> HashMap<Pair, isize> {
     let mut symbol_counts: HashMap<Pair, isize> = HashMap::new();
     for word in words.iter() {
+        if word.symbols.len() < 2 {
+            continue;
+        }
         for i in 0..word.symbols.len() - 1 {
             let pair = (word.symbols[i], word.symbols[i + 1]);
             let count = symbol_counts.entry(pair).or_insert(0);
@@ -221,11 +226,8 @@ pub fn train_bpe<K: AsRef<[u8]> + Eq + Hash>(
     drop(contained_in_words_arr);
 
     println!("{} unique words", words.len());
-    let max_symbols = vocab_size;
 
-    let symbol_counts = count_pairs(&words);
-
-    // Symbols 0 through 255 are unicode characters
+    // Symbols 0 through 255 are the raw bytes; special tokens follow.
     let mut symbols: Vec<Vec<u8>> = (0..=255).map(|x| vec![x]).collect();
     symbols.extend(
         special_tokens
@@ -233,9 +235,45 @@ pub fn train_bpe<K: AsRef<[u8]> + Eq + Hash>(
             .map(|x| x.bytes().collect::<Vec<u8>>()),
     );
 
+    let merges = run_merges(
+        &mut words,
+        &mut contained_in_words,
+        &mut symbols,
+        vocab_size,
+        tie_breaking,
+    );
+
+    let vocab: HashMap<_, _> = symbols
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (i as u32, v))
+        .collect();
+
+    BPEResult { vocab, merges }
+}
+
+/// The shared BPE merge loop, reused by both stage-1 (`train_bpe`) and
+/// stage-2 (`train_superbpe_stage2`) training. Repeatedly merges the
+/// highest-count symbol pair (ties broken per `tie_breaking`) into a new
+/// symbol appended to `symbols`, until `symbols.len()` reaches
+/// `max_symbols` or no pair remains. Returns the merges in priority order.
+///
+/// The starting state must be consistent: every adjacent pair occurring in
+/// some word must key an entry in `contained_in_words`, and every symbol id
+/// used by a word must index `symbols`. This holds for a byte-seeded start
+/// (`train_bpe`) and for a seeded resume from an existing vocabulary
+/// (`train_superbpe_stage2`).
+fn run_merges(
+    words: &mut [Word],
+    contained_in_words: &mut HashMap<(u32, u32), BTreeSet<u32>>,
+    symbols: &mut Vec<Vec<u8>>,
+    max_symbols: usize,
+    tie_breaking: TieBreaking,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     // Build HF rank table for tie-breaking (only used in HuggingFace mode)
     let hf_rank = build_byte_to_hf_rank();
 
+    let symbol_counts = count_pairs(words);
     let mut pq = PriorityQueue::new();
     symbol_counts.into_iter().for_each(|(pair, count)| {
         pq.push(pair, count);
@@ -292,7 +330,7 @@ pub fn train_bpe<K: AsRef<[u8]> + Eq + Hash>(
                 }
                 TieBreaking::AssembledBytes => {
                     let assemble_pair = |(p0, p1)| {
-                        (assemble_token(p0, &symbols), assemble_token(p1, &symbols))
+                        (assemble_token(p0, symbols), assemble_token(p1, symbols))
                     };
                     for pair in tied_pairs.iter().copied() {
                         if assemble_pair(pair) < assemble_pair(smallest_pair) {
@@ -326,8 +364,8 @@ pub fn train_bpe<K: AsRef<[u8]> + Eq + Hash>(
         symbols.push(new_symbol);
 
         let count_changes = update_words(
-            &mut words,
-            &mut contained_in_words,
+            words,
+            contained_in_words,
             pair,
             symbols.len() as u32 - 1,
         );
@@ -340,6 +378,165 @@ pub fn train_bpe<K: AsRef<[u8]> + Eq + Hash>(
         }
     }
     bar.finish();
+
+    merges
+}
+
+/// Build the pair -> word-index inverted index for an arbitrary set of
+/// words whose symbols may be any token ids (not only bytes). The
+/// byte-seeded stage-1 path in [`train_bpe`] builds this with a dense
+/// 256x256 scratch table; this general version seeds a resumed
+/// (stage-2) training run.
+fn build_contained_in_words(words: &[Word]) -> HashMap<(u32, u32), BTreeSet<u32>> {
+    let mut map: HashMap<(u32, u32), BTreeSet<u32>> = HashMap::new();
+    for (word_i, word) in words.iter().enumerate() {
+        for pair in word.symbols.iter().copied().tuple_windows::<(u32, u32)>() {
+            map.entry(pair).or_default().insert(word_i as u32);
+        }
+    }
+    map
+}
+
+/// Emit the `<= max_unit_len` byte units of a single line into `counts`,
+/// splitting at UTF-8 character boundaries so a multi-byte character is
+/// never cut in half.
+fn push_line_units(
+    line: &[u8],
+    max_unit_len: usize,
+    counts: &mut HashMap<Vec<u8>, usize, FxBuildHasher>,
+) {
+    let mut start = 0;
+    while start < line.len() {
+        let mut end = (start + max_unit_len).min(line.len());
+        // Back off to a UTF-8 character boundary (a byte that is not a
+        // 0b10xxxxxx continuation byte), unless that would make no progress.
+        while end < line.len() && end > start && (line[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        if end <= start {
+            end = (start + max_unit_len).min(line.len());
+        }
+        *counts.entry(line[start..end].to_vec()).or_default() += 1;
+        start = end;
+    }
+}
+
+/// Relaxed ("superword") pretokenization for stage 2: whitespace splitting
+/// is lifted, so a unit may span spaces, but units are still bounded on
+/// document `separator`s and newlines and capped at `max_unit_len` bytes.
+/// Bounding is deliberate -- the SuperBPE paper (section 2) notes that
+/// unbounded stage-2 units are whole documents, which dedupe poorly and
+/// blow up memory. Returns a map of unit bytes -> count.
+fn relaxed_unit_counts(
+    bytes: &[u8],
+    separator: &[u8],
+    max_unit_len: usize,
+) -> HashMap<Vec<u8>, usize, FxBuildHasher> {
+    let mut counts: HashMap<Vec<u8>, usize, FxBuildHasher> = HashMap::default();
+    let max_unit_len = max_unit_len.max(1);
+
+    let mut process_doc = |doc: &[u8], counts: &mut HashMap<Vec<u8>, usize, FxBuildHasher>| {
+        for line in doc.split(|&b| b == b'\n') {
+            if !line.is_empty() {
+                push_line_units(line, max_unit_len, counts);
+            }
+        }
+    };
+
+    if separator.is_empty() {
+        process_doc(bytes, &mut counts);
+    } else {
+        let mut last = 0;
+        for pos in memchr::memmem::find_iter(bytes, separator) {
+            process_doc(&bytes[last..pos], &mut counts);
+            last = pos + separator.len();
+        }
+        process_doc(&bytes[last..], &mut counts);
+    }
+
+    counts
+}
+
+/// Stage 2 of SuperBPE: resume BPE training from a stage-1 result with
+/// whitespace pretokenization lifted, learning superword merges.
+///
+/// The stage-1 vocabulary becomes the initial symbol table, and each
+/// relaxed (superword) unit is seeded by encoding it with the stage-1
+/// tokenizer via [`simple_bpe_merge`] (equivalent to encoding each
+/// whitespace-delimited pretoken and concatenating, since no stage-1 merge
+/// bridges whitespace). Merging then continues to `target_vocab_size`.
+///
+/// Returns the combined vocabulary and the stage-1 merges followed by the
+/// stage-2 (superword) merges, in priority order.
+pub fn train_superbpe_stage2(
+    corpus: &[u8],
+    separator: &[u8],
+    stage1: BPEResult,
+    target_vocab_size: usize,
+    tie_breaking: TieBreaking,
+    max_unit_len: usize,
+) -> BPEResult {
+    // Rebuild the contiguous id -> bytes symbol table from stage 1.
+    let n_symbols = stage1.vocab.len();
+    let mut symbols: Vec<Vec<u8>> = vec![Vec::new(); n_symbols];
+    for (id, token_bytes) in stage1.vocab.into_iter() {
+        symbols[id as usize] = token_bytes;
+    }
+
+    // bytes -> id, then a (TokenId, TokenId) -> TokenId merge map so we can
+    // encode stage-2 units with the stage-1 tokenizer. Merged ids are
+    // monotonic in merge order, so `simple_bpe_merge`'s "lowest merged id
+    // first" priority reproduces stage-1's merge order.
+    let mut bytes_to_id: HashMap<Vec<u8>, u32> = HashMap::with_capacity(n_symbols);
+    for (id, token_bytes) in symbols.iter().enumerate() {
+        bytes_to_id.entry(token_bytes.clone()).or_insert(id as u32);
+    }
+
+    let mut merge_map: HashMap<(TokenId, TokenId), TokenId, FxBuildHasher> =
+        HashMap::with_capacity_and_hasher(stage1.merges.len(), FxBuildHasher);
+    for (left, right) in stage1.merges.iter() {
+        let mut merged = left.clone();
+        merged.extend_from_slice(right);
+        let (Some(&li), Some(&ri), Some(&mi)) = (
+            bytes_to_id.get(left),
+            bytes_to_id.get(right),
+            bytes_to_id.get(&merged),
+        ) else {
+            continue;
+        };
+        merge_map.insert((TokenId(li), TokenId(ri)), TokenId(mi));
+    }
+    drop(bytes_to_id);
+
+    // Relaxed (superword) pretokenization, then seed each unit's symbols by
+    // encoding it with the stage-1 tokenizer.
+    let unit_counts = relaxed_unit_counts(corpus, separator, max_unit_len);
+    println!("{} unique superword units", unit_counts.len());
+
+    let mut words: Vec<Word> = Vec::with_capacity(unit_counts.len());
+    for (unit, count) in unit_counts.into_iter() {
+        let encoded = simple_bpe_merge(&merge_map, &unit);
+        if encoded.is_empty() {
+            continue;
+        }
+        words.push(Word {
+            symbols: encoded.into_iter().map(|t| t.0).collect(),
+            word_count: count as isize,
+        });
+    }
+
+    let mut contained_in_words = build_contained_in_words(&words);
+
+    let stage2_merges = run_merges(
+        &mut words,
+        &mut contained_in_words,
+        &mut symbols,
+        target_vocab_size,
+        tie_breaking,
+    );
+
+    let mut merges = stage1.merges;
+    merges.extend(stage2_merges);
 
     let vocab: HashMap<_, _> = symbols
         .into_iter()

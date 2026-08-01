@@ -1,0 +1,306 @@
+{
+  "meta": {
+    "corpus": "C:\\Users\\aryan\\data\\owt_train.txt",
+    "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
+    "docs": 19937,
+    "eval_mb": 99.74,
+    "settings": {
+      "max_unit_len": 128,
+      "tie_breaking": "huggingface",
+      "transition": 40000,
+      "vocab": 50000
+    },
+    "synthetic": false
+  },
+  "tokenizers": {
+    "Qwen/Qwen2-1.5B-Instruct": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5683,
+      "encode_s": 0.543,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21833133,
+      "vocab_size": 151646
+    },
+    "Qwen/Qwen2.5-7B-Instruct": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5683,
+      "encode_s": 0.531,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21833133,
+      "vocab_size": 151665
+    },
+    "Qwen/Qwen3-8B": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5683,
+      "encode_s": 0.526,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21833133,
+      "vocab_size": 151669
+    },
+    "Qwen/Qwen3.5-9B": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5196,
+      "encode_s": 1.492,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22068714,
+      "vocab_size": 248070
+    },
+    "Qwen/Qwen3.6-27B": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5196,
+      "encode_s": 1.407,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22068714,
+      "vocab_size": 248070
+    },
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+      "bytes": 99740832,
+      "bytes_per_token": 3.8881,
+      "encode_s": 2.529,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 25652822,
+      "vocab_size": 32000
+    },
+    "alisawuffles/superbpe-tokenizer-128k": {
+      "bytes": 99740832,
+      "bytes_per_token": 6.231,
+      "encode_s": 46.052,
+      "engine": "hf",
+      "group": "reference",
+      "tokens": 16007082,
+      "vocab_size": 128001
+    },
+    "allenai/Olmo-3-1025-7B": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6631,
+      "encode_s": 0.407,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21389238,
+      "vocab_size": 100278
+    },
+    "answerdotai/ModernBERT-base": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.4137,
+      "encode_s": 0.472,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22598137,
+      "vocab_size": 50368
+    },
+    "codellama/CodeLlama-7b-hf": {
+      "bytes": 99740832,
+      "bytes_per_token": 3.8881,
+      "encode_s": 2.9,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 25652821,
+      "vocab_size": 32016
+    },
+    "deepseek-ai/DeepSeek-R1": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6136,
+      "encode_s": 1.223,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21618688,
+      "vocab_size": 128815
+    },
+    "deepseek-ai/DeepSeek-V3": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6136,
+      "encode_s": 1.212,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21618688,
+      "vocab_size": 128815
+    },
+    "deepseek-ai/DeepSeek-V4-Flash": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6136,
+      "encode_s": 1.056,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21618688,
+      "vocab_size": 129280
+    },
+    "google/gemma-4-E4B-it": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5089,
+      "encode_s": 3.365,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22120654,
+      "vocab_size": 262144
+    },
+    "meta-llama/Llama-3.1-8B": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6674,
+      "encode_s": 1.137,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21369859,
+      "vocab_size": 128256
+    },
+    "microsoft/Phi-3-mini-4k-instruct": {
+      "bytes": 99740832,
+      "bytes_per_token": 3.8881,
+      "encode_s": 2.286,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 25652822,
+      "vocab_size": 32011
+    },
+    "microsoft/Phi-4-mini-instruct": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.7016,
+      "encode_s": 1.373,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21214061,
+      "vocab_size": 200029
+    },
+    "microsoft/phi-4": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6631,
+      "encode_s": 0.42,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21389238,
+      "vocab_size": 100352
+    },
+    "mistralai/Mistral-7B-Instruct-v0.3": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.0222,
+      "encode_s": 2.212,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 24797324,
+      "vocab_size": 32768
+    },
+    "moonshotai/Kimi-K2-Instruct": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6386,
+      "encode_s": 0.625,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21502489,
+      "vocab_size": 163840
+    },
+    "moonshotai/Kimi-K2.5": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6386,
+      "encode_s": 0.589,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21502489,
+      "vocab_size": 163840
+    },
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.4937,
+      "encode_s": 1.129,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22195549,
+      "vocab_size": 131072
+    },
+    "openai-community/gpt2": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.4072,
+      "encode_s": 3.578,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22631261,
+      "vocab_size": 50257
+    },
+    "openai/gpt-oss-120b": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.7016,
+      "encode_s": 0.425,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21214061,
+      "vocab_size": 200019
+    },
+    "openai/gpt-oss-20b": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.7016,
+      "encode_s": 0.46,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21214061,
+      "vocab_size": 200019
+    },
+    "ours_bpe": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.4939,
+      "encode_s": 87.521,
+      "engine": "hf",
+      "group": "ours",
+      "n_superwords": 0,
+      "superword_examples": [],
+      "tokens": 22194723,
+      "train_time_s": 7.02,
+      "vocab_size": 50000
+    },
+    "ours_superbpe": {
+      "bytes": 99740832,
+      "bytes_per_token": 5.6659,
+      "encode_s": 45.081,
+      "engine": "hf",
+      "group": "ours",
+      "n_superwords": 7944,
+      "superword_examples": [
+        "Media playback is unsupported on your device Media caption",
+        "Advertisement Continue reading the main story",
+        "Story continues below advertisement",
+        "Read or Share this story: http://",
+        " Continue reading the main story",
+        " Russell County, Kansas (Plate",
+        "Media playback is unsupported",
+        " on your device Media caption",
+        " contributed to this report.",
+        " Thank you for subscribing",
+        "Facebook Twitter Pinterest",
+        " House of Representatives"
+      ],
+      "tokens": 17603858,
+      "train_time_s": 765.083,
+      "vocab_size": 50000
+    },
+    "unsloth/gemma-2b": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.5235,
+      "encode_s": 3.407,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 22049655,
+      "vocab_size": 256000
+    },
+    "zai-org/GLM-4.7": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6608,
+      "encode_s": 1.049,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21399969,
+      "vocab_size": 151365
+    },
+    "zai-org/GLM-5.2": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.6611,
+      "encode_s": 1.128,
+      "engine": "gigatoken",
+      "group": "repos",
+      "tokens": 21398399,
+      "vocab_size": 154856
+    }
+  }
+}

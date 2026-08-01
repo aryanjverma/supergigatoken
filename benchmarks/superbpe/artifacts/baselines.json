@@ -1,0 +1,49 @@
+{
+  "corpus": {
+    "file": "C:\\Users\\aryan\\data\\owt_train.txt",
+    "separator": "<|endoftext|>",
+    "synthetic": false,
+    "train_bytes": 500000000,
+    "train_mb": 500.0
+  },
+  "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
+  "settings": {
+    "max_unit_len": 128,
+    "tie_breaking": "huggingface",
+    "transition": 40000,
+    "vocab": 50000
+  },
+  "tokenizers": {
+    "ours_bpe": {
+      "n_superwords": 0,
+      "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\ours_bpe.json",
+      "superword_examples": [],
+      "superword_fraction": 0.0,
+      "train_time_s": 7.02,
+      "use_regex": true,
+      "vocab_size": 50000
+    },
+    "ours_superbpe": {
+      "n_superwords": 7944,
+      "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\ours_superbpe.json",
+      "superword_examples": [
+        "Media playback is unsupported on your device Media caption",
+        "Advertisement Continue reading the main story",
+        "Story continues below advertisement",
+        "Read or Share this story: http://",
+        " Continue reading the main story",
+        " Russell County, Kansas (Plate",
+        "Media playback is unsupported",
+        " on your device Media caption",
+        " contributed to this report.",
+        " Thank you for subscribing",
+        "Facebook Twitter Pinterest",
+        " House of Representatives"
+      ],
+      "superword_fraction": 0.1589,
+      "train_time_s": 765.083,
+      "use_regex": false,
+      "vocab_size": 50000
+    }
+  }
+}

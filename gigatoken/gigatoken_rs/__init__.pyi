@@ -64,6 +64,22 @@ def train_bpe(
     tie_breaking: str = "huggingface",
     separator: bytes | None = None,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: ...
+def train_superbpe(
+    in_data: bytes | Path | str,
+    vocab_size: int,
+    transition_point: int,
+    special_tokens: list[str],
+    tie_breaking: str = "huggingface",
+    separator: bytes | None = None,
+    max_unit_len: int = 128,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Train a SuperBPE tokenizer. Stage 1 is ordinary whitespace-
+    pretokenized BPE up to `transition_point` tokens; stage 2 lifts
+    whitespace pretokenization and continues to `vocab_size`, learning
+    "superword" tokens that bridge whitespace. Stage-2 units are bounded on
+    document `separator`s and newlines and capped at `max_unit_len` bytes.
+    Only in-memory bytes or a single text file path are supported (not
+    FileSource or parquet)."""
 
 class PadTruncate:
     """How encode_batch_padded assembles rows into a rectangular matrix; see

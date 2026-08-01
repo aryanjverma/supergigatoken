@@ -72,6 +72,10 @@ struct PreTokenizerJson {
     prepend_scheme: Option<String>,
     #[serde(default)]
     add_prefix_space: Option<bool>,
+    /// `ByteLevel` field: when `false`, the scheme does no regex splitting at
+    /// all — the whitespace-lifted "superword" scheme SuperBPE uses.
+    #[serde(default)]
+    use_regex: Option<bool>,
     #[serde(default)]
     split: Option<bool>,
     /// `Split` field (e.g. "MergedWithPrevious" for the gemma-3/4 no-op
@@ -619,9 +623,16 @@ fn detect_pretokenizer_type(
     let mut regexes = Vec::new();
     collect_split_regexes(pt, &mut regexes);
     if regexes.is_empty() {
-        // ByteLevel with use_regex (the default) splits with the GPT-2 regex.
+        // A bare ByteLevel. `use_regex: true` (the default) splits with the
+        // GPT-2 regex; `use_regex: false` does no splitting at all — the
+        // whitespace-lifted "superword" scheme a SuperBPE tokenizer needs so
+        // its learned cross-whitespace merges fire.
         if pt.kind == "ByteLevel" {
-            return Ok(PretokenizerType::GPT2);
+            return Ok(if pt.use_regex == Some(false) {
+                PretokenizerType::Superword
+            } else {
+                PretokenizerType::GPT2
+            });
         }
         return Err(eyre::eyre!(
             "Unsupported pre_tokenizer type: {} (no Split regex found)",

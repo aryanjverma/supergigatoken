@@ -1,5 +1,5 @@
 # Contributing
-Thank you for your interest in contributing to Gigatoken!
+Thank you for your interest in contributing to Supergigatoken!
 
 Unfortunately I don't have the capacity to review the large flood of PRs most open source projects are getting in the AI-coding age.
 Contributions will thus be limited to submitting GitHub Issues.

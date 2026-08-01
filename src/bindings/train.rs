@@ -123,3 +123,80 @@ pub(crate) fn train_bpe<'py>(
     let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
     bpe_result_to_python(py, result)
 }
+
+/// Train a SuperBPE tokenizer: two-stage BPE where stage 1 is ordinary
+/// whitespace-pretokenized BPE up to `transition_point`, and stage 2
+/// resumes with whitespace pretokenization lifted so merges can bridge
+/// whitespace, learning "superword" tokens up to `vocab_size`.
+///
+/// Because the raw corpus is needed twice (stage 1 pretokenized, stage 2
+/// relaxed), this currently accepts only in-memory bytes or a single text
+/// file path -- not FileSource or parquet.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+#[pyo3(signature = (in_data, vocab_size, transition_point, special_tokens, tie_breaking = "huggingface", separator = None, max_unit_len = 128))]
+pub(crate) fn train_superbpe<'py>(
+    py: Python<'py>,
+    in_data: Bound<'py, PyAny>,
+    vocab_size: usize,
+    transition_point: usize,
+    special_tokens: Vec<String>,
+    tie_breaking: &str,
+    separator: Option<&[u8]>,
+    max_unit_len: usize,
+) -> PyResult<(
+    Bound<'py, PyDict>,
+    Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
+)> {
+    assert!(
+        vocab_size <= 2_usize.pow(32),
+        "vocab_size must be less than 2^32"
+    );
+    if transition_point > vocab_size {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "transition_point ({transition_point}) must be <= vocab_size ({vocab_size})"
+        )));
+    }
+    let tie_breaking = parse_tie_breaking(tie_breaking)?;
+    let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
+
+    // train_superbpe reads the corpus twice, so it supports only in-memory
+    // bytes or a single (non-parquet) text file path for now.
+    let mmap_resource;
+    let bytes: &[u8] = if in_data.is_instance_of::<PyBytes>() {
+        in_data.extract::<&[u8]>()?
+    } else if let Ok(path) = in_data.extract::<PathBuf>() {
+        if path.extension().is_some_and(|ext| ext == "parquet") {
+            return Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+                "train_superbpe does not support parquet input; pass bytes or a text file path",
+            ));
+        }
+        mmap_resource = MmappedFile::open(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                "Failed to open file {:?}: {}",
+                path, e
+            ))
+        })?;
+        mmap_resource.as_bytes()
+    } else {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "train_superbpe in_data must be bytes or a text file path",
+        ));
+    };
+
+    // Stage 1: standard whitespace-pretokenized BPE up to the transition point.
+    let counts = pretokenize::pretokenize_par_bytes(bytes, separator);
+    let stage1 = bpe_train::train_bpe(counts, transition_point, special_tokens, tie_breaking);
+
+    // Stage 2: resume with whitespace pretokenization lifted (superwords).
+    let result = bpe_train::train_superbpe_stage2(
+        bytes,
+        separator,
+        stage1,
+        vocab_size,
+        tie_breaking,
+        max_unit_len,
+    );
+
+    bpe_result_to_python(py, result)
+}

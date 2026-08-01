@@ -8,6 +8,7 @@
 use crate::Tokenizer;
 use crate::bpe;
 use crate::bpe::madvise_hugepage;
+use crate::pretokenize::PretokenizerType;
 use crate::input::DocumentIter;
 use crate::input::file_source::{DocFormat, chunk_ranges};
 use std::ops::Range;
@@ -193,6 +194,7 @@ fn build_doc_chunks<'a>(
     target: usize,
     added_tokens: &[(&[u8], bool)],
     lpt: bool,
+    can_split: bool,
 ) -> Vec<EncodeChunk<'a>> {
     let (head_bytes, group_big, frag_big, tail_target) = if lpt {
         (
@@ -211,7 +213,10 @@ fn build_doc_chunks<'a>(
     let mut emitted = 0usize;
     let mut acc = 0usize;
     for &doc in docs {
-        if doc.len() > 2 * target {
+        // `can_split == false` (the Superword scheme, whose learned merges
+        // bridge whitespace) has no provably safe interior boundary, so an
+        // oversized document stays one chunk instead of being fragmented.
+        if can_split && doc.len() > 2 * target {
             if !group.is_empty() {
                 chunks.push(EncodeChunk::Docs(std::mem::take(&mut group)));
                 emitted += acc;
@@ -776,7 +781,10 @@ pub(crate) fn encode_docs_ragged_with(
 ) -> (Vec<u32>, Vec<i64>) {
     let total: usize = docs.iter().map(|d| d.len()).sum();
     let added = proto.added_token_split_blockers();
-    let chunks = build_doc_chunks(docs, total, chunk_target_bytes(total), &added, lpt);
+    // The Superword scheme lifts whitespace splitting, so no interior cut is
+    // provably pretoken-safe; every other scheme fragments oversized docs.
+    let can_split = proto.pretokenizer_type() != PretokenizerType::Superword;
+    let chunks = build_doc_chunks(docs, total, chunk_target_bytes(total), &added, lpt, can_split);
     encode_chunks_gathered(workers, proto, &chunks, total)
 }
 
@@ -1524,7 +1532,7 @@ mod tests {
         let docs: Vec<&[u8]> = owned.iter().map(|d| d.as_slice()).collect();
         let total: usize = docs.iter().map(|d| d.len()).sum();
         let added = proto.added_token_split_blockers();
-        let chunks = build_doc_chunks(&docs, total, chunk_target_bytes(total), &added, true);
+        let chunks = build_doc_chunks(&docs, total, chunk_target_bytes(total), &added, true, true);
         assert!(chunks.len() > 1, "test must exercise the parallel path");
 
         let workers = WorkerPool::new();

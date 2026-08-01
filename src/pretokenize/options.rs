@@ -3,6 +3,7 @@ use crate::pretokenize::fast::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastKimiPretokenizer,
     FastNemotronPretokenizer, FastO200kPretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    FastSuperwordPretokenizer,
 };
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
@@ -17,6 +18,7 @@ pub enum PretokenizerType {
     O200k,      // o200k_base: case-structured letter runs; GPT-4o, gpt-oss
     Nemotron,   // o200k without contractions, single-digit \p{N}; nvidia Nemotron-3
     Kimi,       // o200k with [\p{Han}]+ runs and no `/` tail absorption; moonshotai Kimi-K2 line
+    Superword,  // whitespace-lifted: no splitting at all (ByteLevel use_regex=false); SuperBPE
 }
 
 /// The three Split regexes of the DeepSeek V3/V4 pre_tokenizer Sequence, as
@@ -63,13 +65,16 @@ impl PretokenizerType {
             PretokenizerType::Kimi => {
                 FastPretokenizerDispatch::Kimi(FastKimiPretokenizer::new(bytes))
             }
+            PretokenizerType::Superword => {
+                FastPretokenizerDispatch::Superword(FastSuperwordPretokenizer::new(bytes))
+            }
         }
     }
 
     /// The canonical name of each variant, in variant order — the
     /// identifiers `from_name` accepts (plus the aliases listed there).
     /// Error messages naming the valid schemes derive from this list.
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 10] = [
         "gpt2",
         "gpt4",
         "qwen2",
@@ -79,6 +84,7 @@ impl PretokenizerType {
         "o200k",
         "nemotron",
         "kimi",
+        "superword",
     ];
 
     /// The scheme named by a lowercase identifier, as used by loaders whose
@@ -96,6 +102,7 @@ impl PretokenizerType {
             "o200k" => PretokenizerType::O200k,
             "nemotron" => PretokenizerType::Nemotron,
             "kimi" => PretokenizerType::Kimi,
+            "superword" => PretokenizerType::Superword,
             _ => return None,
         })
     }
@@ -154,6 +161,7 @@ pub enum FastPretokenizerDispatch<'a> {
     O200k(FastO200kPretokenizer<'a>),
     Nemotron(FastNemotronPretokenizer<'a>),
     Kimi(FastKimiPretokenizer<'a>),
+    Superword(FastSuperwordPretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -171,6 +179,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::O200k(it) => it.next(),
             FastPretokenizerDispatch::Nemotron(it) => it.next(),
             FastPretokenizerDispatch::Kimi(it) => it.next(),
+            FastPretokenizerDispatch::Superword(it) => it.next(),
         }
     }
 }
@@ -197,6 +206,7 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::O200k(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Nemotron(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Kimi(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Superword(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
 }

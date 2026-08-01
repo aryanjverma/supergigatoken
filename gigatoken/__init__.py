@@ -6,6 +6,7 @@ from gigatoken.gigatoken_rs import (
     TextFileSource,
     pretokenizer,
     train_bpe,
+    train_superbpe,
 )
 
 from gigatoken._hf_compat import HFCompat
@@ -23,4 +24,5 @@ __all__ = [
     "Tokenizer",
     "pretokenizer",
     "train_bpe",
+    "train_superbpe",
 ]

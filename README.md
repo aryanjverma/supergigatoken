@@ -1,28 +1,106 @@
-# Gigatoken
+# Supergigatoken
 
 <div align="center">
 
-~1000x faster than HuggingFace's tokenizers, drop-in replacement.
+**[Gigatoken](https://github.com/marcelroed/gigatoken)'s ~1000x-faster tokenization — now with native SuperBPE.**
 
-*Tokenize your text data at GB/s!*
+*Tokenize at GB/s, and train + encode SuperBPE tokenizers that pack ~20% more text into every token.*
 
 ![GPT-2 Speedup](https://raw.githubusercontent.com/marcelroed/gigatoken/main/assets/throughput_owt_train_gpt-2.svg)
 
 Note that both HF tokenizers and tiktoken are already running multithreaded Rust!
 </div>
 
-## What is Gigatoken?
-Gigatoken is the fastest tokenizer for language modeling.
-It supports a wide range of CPU hardware, and nearly all commonly used tokenizers.
-See the [Benchmarks](#benchmarks) section for detailed throughput numbers across tokenizers and CPUs.
+## What is Supergigatoken?
+Supergigatoken is [gigatoken](https://github.com/marcelroed/gigatoken) — the fastest tokenizer for language modeling — extended with **SuperBPE**.
+SuperBPE is a two-stage byte-pair encoding that first learns ordinary subwords, then lifts the whitespace restriction to learn *superwords* that span multiple words, encoding the same text in meaningfully fewer tokens.
+
+It keeps everything gigatoken does — SIMD pretokenization, GB/s encoding, HuggingFace/tiktoken compatibility, and the drop-in `import gigatoken` API — and adds:
+- **`train_superbpe(...)`** — native two-stage SuperBPE training in Rust.
+- a **`Superword` encoder** so gigatoken can *fast-encode* SuperBPE tokenizers (which HuggingFace can only do slowly, and tiktoken cannot represent at all).
+- a full **evaluation suite** under [`benchmarks/superbpe/`](benchmarks/superbpe/).
+
+See [SuperBPE](#superbpe) for the efficiency/throughput results, and [Benchmarks](#benchmarks) for the inherited GB/s encoding-speed numbers across tokenizers and CPUs.
+
+> Supergigatoken keeps the `gigatoken` import name and CLI — it is a strict superset of gigatoken, so all existing gigatoken code keeps working.
+
+## SuperBPE
+
+SuperBPE ([Liu et al., 2025](https://arxiv.org/abs/2503.13423)) trains BPE in two stages: **stage 1** is ordinary whitespace-pretokenized BPE (subwords), and **stage 2** resumes training with the whitespace restriction lifted, learning *superwords* that bridge multiple words (e.g. `of the`, `in the United States`).
+Because a single token can now cover several words, SuperBPE encodes text in far fewer tokens at the same vocabulary size.
+Supergigatoken implements both the trainer and a fast encoder natively.
+
+![SuperBPE encoding efficiency](assets/superbpe_efficiency.png)
+
+### Encoding efficiency (bytes/token)
+
+Trained on 500 MB of OpenWebText at a matched **50k vocab** (40k transition → ~8k superwords), measured on a disjoint **100 MB** held-out slice. Higher bytes/token = fewer tokens for the same text = more efficient.
+
+| Tokenizer | Vocab | Bytes/token | Tokens (100 MB) | |
+|---|---:|---:|---:|---|
+| Released SuperBPE | 128k | **6.23** | 16.0M | reference (Liu et al.) |
+| **supergigatoken** (SuperBPE) | **50k** | **5.67** | **17.6M** | `train_superbpe` |
+| gpt-oss / Phi-4-mini | 200k | 4.70 | 21.2M | standard BPE |
+| Llama 3.1 | 128k | 4.67 | 21.4M | standard BPE |
+| Gemma 4 | 262k | 4.51 | 22.1M | standard BPE |
+| **gigatoken** (plain BPE) | **50k** | **4.49** | **22.2M** | same corpus/vocab, no superwords |
+| GPT-2 | 50k | 4.41 | 22.6M | standard BPE |
+
+At a matched 50k vocab, supergigatoken's SuperBPE encodes the held-out slice in **20.7% fewer tokens** than plain gigatoken BPE (5.67 vs 4.49 bytes/token — the controlled comparison, since only the whitespace restriction differs).
+Remarkably, a **50k** SuperBPE beats *every* standard tokenizer measured, including ones with 4–5× larger vocabularies (Gemma 4 at 262k, Qwen 3.5 at 248k).
+
+### Encoding throughput (supergigatoken vs HuggingFace)
+
+supergigatoken fast-encodes a SuperBPE tokenizer via a new `Superword` pretokenizer scheme; tiktoken cannot represent SuperBPE at all. Same 100 MB slice, Intel 8-core CPU:
+
+![SuperBPE encoding throughput](assets/superbpe_throughput.png)
+
+| Tokenizer | supergigatoken | HF tokenizers | speedup |
+|---|---:|---:|---:|
+| supergigatoken (SuperBPE, 50k) | 19.3 MB/s | 2.0 MB/s | **9.6×** |
+
+Both bars encode the *same* tokenizer; they differ only in which engine does the work. Lifting whitespace pretokenization turns each document into one long pretoken, so SuperBPE encoding is inherently slower than gigatoken's cached GB/s subword path — but it is still ~10× faster than HuggingFace. (For reference, HuggingFace encodes the released 128k SuperBPE at ~2.9 MB/s; supergigatoken can't fast-encode that checkpoint yet because it ships a `Split`-regex pretokenizer the loader doesn't map to `Superword` — see [Known Issues](#known-issues).)
+
+### Train your own
+
+```python
+import gigatoken as gt
+
+corpus = open("owt_train.txt", "rb").read()
+vocab, merges = gt.train_superbpe(
+    corpus,
+    vocab_size=50_000,
+    transition_point=40_000,   # stage 1 stops here; the remaining merges are superwords
+    special_tokens=[],
+)
+```
+
+Our 50k SuperBPE trained in ~13 min on 500 MB (stage 2 is O(n) in unit length; keep `--train-mb`/`--vocab` modest for quick runs).
+The [`benchmarks/superbpe/`](benchmarks/superbpe/) suite exports the result to a HuggingFace `tokenizer.json` (with a whitespace-lifted `ByteLevel(use_regex=False)` pretokenizer so superwords fire) and reproduces every number above:
+
+```bash
+uv run benchmarks/superbpe/train_baselines.py --file ~/data/owt_train.txt
+uv run benchmarks/superbpe/efficiency.py --released
+uv run benchmarks/superbpe/throughput.py --released
+uv run benchmarks/superbpe/report.py     # tables + plots -> benchmarks/superbpe/REPORT.md
+```
+
+The full three-axis write-up (efficiency, throughput, and trainer parity vs the original SuperBPE reference) lives in [benchmarks/superbpe/REPORT.md](benchmarks/superbpe/REPORT.md).
 
 ## Installation
+The upstream fast tokenizer is on PyPI:
 ```bash
 pip install gigatoken
 ```
 
+The **SuperBPE** additions (`train_superbpe`, the `Superword` encoder, and the eval suite) live in this fork — build it from source with [`uv`](https://docs.astral.sh/uv/) and a Rust toolchain:
+```bash
+git clone <this-repo> && cd supergigatoken
+uv run python -c "import gigatoken; print('ok')"   # builds the Rust extension on first run
+```
+
 ## Usage
-Gigatoken can be used with its own API, or in compatibility mode with HuggingFace Tokenizers or Tiktoken.
+Supergigatoken can be used with its own (native) API, or in compatibility mode with HuggingFace Tokenizers or Tiktoken. The Python module is imported as `gigatoken`.
 
 ### Compatibility Mode (Easiest)
 ```python
@@ -44,9 +122,9 @@ tokens = tokenizer.encode_batch(["This is a test string", "And here is another"]
 ```
 
 A substantial amount of effort has been put into making sure the outputs match exactly with what you would get with HuggingFace Tokenizers in this setting, but this is at a non-negligible cost to performance.
-You can still expect way faster performance across the board, but not quite the 1000x you will get with the Gigatoken API.
+You can still expect way faster performance across the board, but not quite the 1000x you will get with the native API.
 
-### Gigatoken API (Fastest)
+### Native API (Fastest)
 ```python
 import gigatoken as gt
 
@@ -55,7 +133,7 @@ file_source = gt.TextFileSource(["owt_train.txt"], separator=b"<|endoftext|>")
 tokens = tokenizer.encode_files(file_source)
 ```
 
-Using the Gigatoken API lets the Rust implementation read data directly, and skips as much overhead as possible while allowing for maximum parallelism.
+Using the native API lets the Rust implementation read data directly, and skips as much overhead as possible while allowing for maximum parallelism.
 Keep in mind that passing Python data structures through this API still incurs the overhead of reading from Python.
 
 <!-- benchmarks:start -->
@@ -154,13 +232,14 @@ Keep in mind that passing Python data structures through this API still incurs t
 <details>
 <summary><b>Benchmark details</b></summary>
 
+These are the inherited gigatoken encoding-speed numbers for standard (subword) tokenizers; see [SuperBPE](#superbpe) for SuperBPE-specific throughput.
 OWT (openwebtext) was chosen because it's roughly representative of the text you get after extraction from CommonCrawl documents.
-Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
+Supergigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
 HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.
 This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout processing.
 Tiktoken rows are currently only filled in for tokenizers with official support.
 
-The slowest rows are the SentencePiece-based tokenizers, which are not well optimized in Gigatoken.
+The slowest rows are the SentencePiece-based tokenizers, which are not well optimized in Supergigatoken.
 
 Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured on a representative repo.
 If you don't see your tokenizer here, it's likely based on some existing one.
@@ -251,7 +330,7 @@ Additionally, Gigatoken uses concurrent data structures to use multiprocessing i
 
 
 ## Citation
-If you use Gigatoken in your research, please cite it as:
+Supergigatoken builds on gigatoken (the fast encoder) and SuperBPE (the two-stage training method). If you use it in your research, please cite both:
 
 ```bibtex
 @software{roed2026gigatoken,
@@ -260,21 +339,37 @@ If you use Gigatoken in your research, please cite it as:
   url = {https://github.com/marcelroed/gigatoken},
   year = {2026},
 }
+
+@inproceedings{liu-etal-2025-superbpe,
+  title     = {{SuperBPE}: Space Travel for Language Models},
+  author    = {Alisa Liu and Jonathan Hayase and Valentin Hofmann and Sewoong Oh and Noah A. Smith and Yejin Choi},
+  booktitle = {Second Conference on Language Modeling},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2503.13423},
+}
 ```
 
 ## Known Issues
 * Python iteration is handled in Rust, but uses ABI3, which is slower than using internal version-specific CPython APIs. In the future I intend to specialize for each Python version to cut this overhead. Early experiments show a 2x speed improvement for overhead-bound cases.
-* File sinks are not yet implemented in the Gigatoken API.
+* File sinks are not yet implemented in the native API.
 * WordPiece is not yet supported.
 * SentencePiece-based tokenization is not nearly as optimized as the more common BPE tokenizers. This is low priority for now since mostly Google models/BERT style models use SentencePiece.
 * Windows has not been tested much, so for now prefer using WSL.
+
+### SuperBPE-specific
+* The fast `Superword` encoder currently loads SuperBPE tokenizers exported with a `ByteLevel(use_regex=False)` pretokenizer. The released 128k SuperBPE ships an explicit `Split`-regex pretokenizer that isn't mapped to `Superword` yet, so gigatoken can't fast-encode it (HuggingFace-only for now).
+* SuperBPE encoding lifts whitespace pretokenization, so each document is one long pretoken and the per-word cache doesn't apply — it's ~10× faster than HuggingFace but well below gigatoken's GB/s subword path. SIMD acceleration of the superword scheme is future work.
+* Stage-2 training is O(n) in unit length; training large vocabs on hundreds of MB is minutes-scale. Our stage 1 is locked to the GPT-2 regex and stage 2 uses line-bounded units, so results are *outcome*-comparable to the original SuperBPE, not byte-identical merges.
 
 ---
 
 <details>
 <summary>AI Use Disclosure</summary>
-A majority of this code base was crafted by hand without any use of AI (which can be seen from the project's Git history).
-In the final stages of the project, AI was used to assist:
+
+The **SuperBPE extension** in this fork (the `train_superbpe` trainer, the `Superword` encoder + loader, and the `benchmarks/superbpe/` evaluation suite) was implemented with AI assistance.
+
+For the underlying **gigatoken** code base: a majority was crafted by hand without any use of AI (which can be seen from the project's Git history).
+In the final stages of that project, AI was used to assist:
 
 * Implementing the user-facing API
 * Widening of compatibility, for instance generalizing and porting the pretokenizer implementations to support more tokenizers, less interesting features like padding/truncation/unicode normalization

@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "corpus": "C:\\Users\\aryan\\data\\owt_train.txt",
+    "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
+    "eval_mb": 99.74,
+    "note": "outcome parity (speed + quality), not byte-identical merges",
+    "settings": {
+      "max_unit_len": 128,
+      "tie_breaking": "huggingface",
+      "transition": 40000,
+      "vocab": 50000
+    },
+    "synthetic": false
+  },
+  "sides": {
+    "ours": {
+      "bytes_per_token": 5.6659,
+      "engine": "gigatoken train_superbpe",
+      "measured_vocab": 50000,
+      "n_superwords": 7944,
+      "stage1_time_s": null,
+      "stage2_time_s": null,
+      "superword_examples": [
+        "Media playback is unsupported on your device Media caption",
+        "Advertisement Continue reading the main story",
+        "Story continues below advertisement",
+        "Read or Share this story: http://",
+        " Continue reading the main story",
+        " Russell County, Kansas (Plate",
+        "Media playback is unsupported",
+        " on your device Media caption",
+        " contributed to this report.",
+        " Thank you for subscribing",
+        "Facebook Twitter Pinterest",
+        " House of Representatives"
+      ],
+      "superword_fraction": 0.1589,
+      "tokens": 17603858,
+      "train_time_s": 765.083,
+      "vocab_size": 50000
+    }
+  }
+}

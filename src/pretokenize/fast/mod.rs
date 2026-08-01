@@ -19,6 +19,7 @@ pub mod olmo3;
 pub mod qwen2;
 pub mod qwen3_5;
 pub mod r50k;
+pub mod superword;
 
 pub use cl100k::FastCl100kPretokenizer;
 pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
@@ -29,6 +30,7 @@ pub use olmo3::FastOlmo3Pretokenizer;
 pub use qwen2::FastQwen2Pretokenizer;
 pub use qwen3_5::FastQwen35Pretokenizer;
 pub use r50k::FastR50kPretokenizer;
+pub use superword::FastSuperwordPretokenizer;
 
 use crate::pretokenize::SpanBatch;
 use crate::pretokenize::unicode;

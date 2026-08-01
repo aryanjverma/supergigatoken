@@ -1,0 +1,21 @@
+# Isolated environment for the ORIGINAL SuperBPE reference trainer
+# (Axis 3 baseline). These pins mirror PythonNut/superbpe and pull the
+# alisawuffles fork of huggingface/tokenizers, which is INCOMPATIBLE with the
+# `tokenizers` gigatoken's dev env uses -- install these in a dedicated venv
+# (see README.md), never into the gigatoken uv environment.
+#
+# The fork is what makes stage-2 "superword" training (whitespace restriction
+# lifted mid-training) possible; upstream `tokenizers` cannot resume training.
+
+# The SuperBPE tokenizers fork (build requires a Rust toolchain).
+git+https://github.com/alisawuffles/tokenizers-superbpe.git#subdirectory=bindings/python
+
+click>=8.1
+regex>=2024.5.15
+tqdm>=4.67.1
+huggingface-hub>=0.20.0
+
+# NOTE: the reference trainer itself (train_tokenizer.py, utils.py) lives in the
+# cloned repo, not on PyPI:
+#     git clone --recurse-submodules https://github.com/PythonNut/superbpe.git
+# run_reference.py shells into that checkout via --superbpe-repo.
