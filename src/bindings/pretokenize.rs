@@ -55,7 +55,11 @@ pub(crate) fn pretokenized_counts<'py>(
     separator: Option<&[u8]>,
 ) -> PyResult<Vec<(Bound<'py, PyBytes>, usize)>> {
     let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
-    let tokens_counts = pretokenize::pretokenize_par_bytes(text.as_bytes(), separator);
+    let tokens_counts = pretokenize::pretokenize_par_bytes(
+        text.as_bytes(),
+        separator,
+        pretokenize::PretokenizerType::GPT2,
+    );
     let tokens_counts = tokens_counts
         .into_iter()
         .map(|(k, v)| (PyBytes::new(text.py(), k.as_ref()), v))

@@ -213,7 +213,13 @@ fn pretokenize_plain_text_bytes(
     bytes: &[u8],
     separator: &[u8],
 ) -> HashMap<Vec<u8>, usize, FxBuildHasher> {
-    let borrowed_counts = pretokenize_par_bytes(bytes, separator);
+    // FileSource training is GPT-2-only; `train_bpe` rejects a non-default
+    // pretokenizer before it can reach this path.
+    let borrowed_counts = pretokenize_par_bytes(
+        bytes,
+        separator,
+        crate::pretokenize::PretokenizerType::GPT2,
+    );
     borrowed_counts
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_vec(), v))

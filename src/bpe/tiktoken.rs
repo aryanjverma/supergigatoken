@@ -1638,6 +1638,7 @@ mod tests {
             PretokenizerType::O200k,
             PretokenizerType::Nemotron,
             PretokenizerType::Kimi,
+            PretokenizerType::SuperBPEStage1,
         ];
         let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();
 

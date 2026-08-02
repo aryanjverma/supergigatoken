@@ -663,11 +663,18 @@ pub fn safe_split_ranges(
 // Parallel pretokenization with document splitting
 // ---------------------------------------------------------------------------
 
-/// Pretokenize `bytes` in parallel, splitting documents on `separator`.
-/// Returns a map of pretoken → count.
+/// Pretokenize `bytes` in parallel under `scheme`, splitting documents on
+/// `separator`. Returns a map of pretoken → count.
+///
+/// `scheme` dispatches once per pretoken (see
+/// [`PretokenizerType::pretokenize`]); that cost is immaterial here because
+/// callers make a single counting pass over a whole corpus, and it is what
+/// lets BPE training select a pretokenization scheme rather than being
+/// pinned to GPT-2's.
 pub fn pretokenize_par_bytes<'a>(
     bytes: &'a [u8],
     separator: &'a [u8],
+    scheme: PretokenizerType,
 ) -> HashMap<Pretoken<'a>, usize, rustc_hash::FxBuildHasher> {
     let start_time = std::time::Instant::now();
     let n_threads = rayon::current_num_threads();
@@ -679,7 +686,7 @@ pub fn pretokenize_par_bytes<'a>(
         .into_par_iter()
         .map(|doc_iter| {
             doc_iter
-                .flat_map(|doc| doc.pretokens())
+                .flat_map(|doc| scheme.pretokenize(doc))
                 .pretoken_count()
         })
         .par_merge_counts();
@@ -988,6 +995,11 @@ mod span_source_tests {
             FastDeepSeekV3Pretokenizer::new(b),
             "deepseek_v3",
         );
+        check_source(
+            crate::pretokenize::fast::FastSuperBPEStage1Pretokenizer::new(b),
+            crate::pretokenize::fast::FastSuperBPEStage1Pretokenizer::new(b),
+            "superbpe_stage1",
+        );
     }
 
     /// Every scheme's chunked `fill_spans_keyed` must reproduce its
@@ -1032,6 +1044,7 @@ mod span_source_tests {
                 PretokenizerType::Olmo3,
                 PretokenizerType::DeepSeekV3,
                 PretokenizerType::Kimi,
+                PretokenizerType::SuperBPEStage1,
             ] {
                 check_source(pt.pretokenize(b), pt.pretokenize(b), "dispatch");
             }

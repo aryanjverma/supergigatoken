@@ -35,6 +35,27 @@ fn bpe_result_to_python<'py>(
     Ok((vocab_py?, merges_py))
 }
 
+/// Reject a non-GPT-2 `pretokenizer` on an input path that cannot honor it.
+///
+/// The multi-file / parquet paths count pretokens inside `FileSourceSpec`,
+/// which is not scheme-parameterized. Erroring is deliberate: silently
+/// pretokenizing with GPT-2 after the caller asked for another scheme would
+/// train a tokenizer that disagrees with its own declared pretokenizer.
+fn require_default_pretokenizer(
+    scheme: pretokenize::PretokenizerType,
+    what: &str,
+) -> PyResult<()> {
+    if scheme != pretokenize::PretokenizerType::GPT2 {
+        return Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+            format!(
+                "pretokenizer must be 'gpt2' for {what}; pass bytes or a single \
+                 text file path to train with another scheme"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_tie_breaking(s: &str) -> PyResult<bpe_train::TieBreaking> {
     match s {
         "huggingface" => Ok(bpe_train::TieBreaking::HuggingFace),
@@ -48,7 +69,7 @@ fn parse_tie_breaking(s: &str) -> PyResult<bpe_train::TieBreaking> {
 
 #[pyfunction]
 #[allow(clippy::type_complexity)]
-#[pyo3(signature = (in_data, vocab_size, special_tokens, tie_breaking = "huggingface", separator = None))]
+#[pyo3(signature = (in_data, vocab_size, special_tokens, tie_breaking = "huggingface", separator = None, pretokenizer = "gpt2"))]
 pub(crate) fn train_bpe<'py>(
     py: Python<'py>,
     in_data: Bound<'py, PyAny>,
@@ -56,6 +77,7 @@ pub(crate) fn train_bpe<'py>(
     special_tokens: Vec<String>,
     tie_breaking: &str,
     separator: Option<&[u8]>,
+    pretokenizer: &str,
 ) -> PyResult<(
     Bound<'py, PyDict>,
     Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
@@ -65,10 +87,12 @@ pub(crate) fn train_bpe<'py>(
         "vocab_size must be less than 2^32"
     );
     let tie_breaking = parse_tie_breaking(tie_breaking)?;
+    let scheme = super::pretokenize::pretokenizer_scheme(pretokenizer)?;
     let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
 
     // --- FileSource: multi-file parallel processing ---
     if let Ok(file_source) = in_data.extract::<FileSource>() {
+        require_default_pretokenizer(scheme, "FileSource")?;
         let spec = FileSourceSpec {
             paths: file_source.paths,
             format: file_source.format,
@@ -91,6 +115,7 @@ pub(crate) fn train_bpe<'py>(
         if let Some(ext) = path.extension()
             && ext == "parquet"
         {
+            require_default_pretokenizer(scheme, "parquet input")?;
             // A bare path takes the default column "text", matching
             // detect_default_format; use ParquetFileSource to choose another
             // column.
@@ -119,7 +144,7 @@ pub(crate) fn train_bpe<'py>(
         ));
     };
 
-    let counts = pretokenize::pretokenize_par_bytes(bytes, separator);
+    let counts = pretokenize::pretokenize_par_bytes(bytes, separator, scheme);
     let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
     bpe_result_to_python(py, result)
 }
@@ -132,9 +157,19 @@ pub(crate) fn train_bpe<'py>(
 /// Because the raw corpus is needed twice (stage 1 pretokenized, stage 2
 /// relaxed), this currently accepts only in-memory bytes or a single text
 /// file path -- not FileSource or parquet.
+///
+/// `pretokenizer` selects the stage-1 scheme (see
+/// `PretokenizerType::NAMES`); stage 2 is always the relaxed superword
+/// unit scheme. Pass `"superbpe_stage1"` to match the original SuperBPE
+/// trainer's stage-1 regex, whose letter classes include `\p{M}` so
+/// combining marks stay inside their letter run. The `"gpt2"` default
+/// excludes `\p{M}`, which fragments scripts that write vowels as marks
+/// (e.g. Devanagari) and — because stage 2 lifts all splitting — lets
+/// stage 2 repair damage stage 1 caused, inflating the apparent superword
+/// gain for exactly those scripts.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
-#[pyo3(signature = (in_data, vocab_size, transition_point, special_tokens, tie_breaking = "huggingface", separator = None, max_unit_len = 128))]
+#[pyo3(signature = (in_data, vocab_size, transition_point, special_tokens, tie_breaking = "huggingface", separator = None, max_unit_len = 128, pretokenizer = "gpt2"))]
 pub(crate) fn train_superbpe<'py>(
     py: Python<'py>,
     in_data: Bound<'py, PyAny>,
@@ -144,6 +179,7 @@ pub(crate) fn train_superbpe<'py>(
     tie_breaking: &str,
     separator: Option<&[u8]>,
     max_unit_len: usize,
+    pretokenizer: &str,
 ) -> PyResult<(
     Bound<'py, PyDict>,
     Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
@@ -158,6 +194,7 @@ pub(crate) fn train_superbpe<'py>(
         )));
     }
     let tie_breaking = parse_tie_breaking(tie_breaking)?;
+    let scheme = super::pretokenize::pretokenizer_scheme(pretokenizer)?;
     let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
 
     // train_superbpe reads the corpus twice, so it supports only in-memory
@@ -185,7 +222,7 @@ pub(crate) fn train_superbpe<'py>(
     };
 
     // Stage 1: standard whitespace-pretokenized BPE up to the transition point.
-    let counts = pretokenize::pretokenize_par_bytes(bytes, separator);
+    let counts = pretokenize::pretokenize_par_bytes(bytes, separator, scheme);
     let stage1 = bpe_train::train_bpe(counts, transition_point, special_tokens, tie_breaking);
 
     // Stage 2: resume with whitespace pretokenization lifted (superwords).

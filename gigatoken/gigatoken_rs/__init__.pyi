@@ -63,7 +63,12 @@ def train_bpe(
     special_tokens: list[str],
     tie_breaking: str = "huggingface",
     separator: bytes | None = None,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: ...
+    pretokenizer: str = "gpt2",
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Train a BPE tokenizer. `pretokenizer` names the pretokenization
+    scheme; it must be "gpt2" for FileSource and parquet inputs, whose
+    counting path is not scheme-parameterized."""
+
 def train_superbpe(
     in_data: bytes | Path | str,
     vocab_size: int,
@@ -72,6 +77,7 @@ def train_superbpe(
     tie_breaking: str = "huggingface",
     separator: bytes | None = None,
     max_unit_len: int = 128,
+    pretokenizer: str = "gpt2",
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Train a SuperBPE tokenizer. Stage 1 is ordinary whitespace-
     pretokenized BPE up to `transition_point` tokens; stage 2 lifts
@@ -79,7 +85,13 @@ def train_superbpe(
     "superword" tokens that bridge whitespace. Stage-2 units are bounded on
     document `separator`s and newlines and capped at `max_unit_len` bytes.
     Only in-memory bytes or a single text file path are supported (not
-    FileSource or parquet)."""
+    FileSource or parquet).
+
+    `pretokenizer` selects the stage-1 scheme. Pass "superbpe_stage1" to
+    match the original SuperBPE trainer's stage-1 regex, whose letter
+    classes include `\\p{M}` so combining marks stay inside their letter
+    run; the "gpt2" default excludes `\\p{M}` and fragments scripts that
+    write vowels as marks (e.g. Devanagari)."""
 
 class PadTruncate:
     """How encode_batch_padded assembles rows into a rectangular matrix; see
