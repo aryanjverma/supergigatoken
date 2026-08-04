@@ -1,4 +1,5 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
+use crate::bpe::superword::{Level1Units, SuperwordPlan};
 use crate::bpe::{
     ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, bpe_merge_symbols_by_rank,
     bpe_merge_symbols_ranked, bpe_merge_symbols_ranked_slice, bpe_merge_symbols_short_scalar,
@@ -9,7 +10,8 @@ use crate::bpe::bpe_merge_symbols_short_neon;
 use crate::pretokenize::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PRETOKEN_CHUNK,
-    Pretoken, PretokenSpans, PretokenizerType, SpanBatch, pack_pretoken_key, pretoken_key_hash,
+    Pretoken, PretokenSpans, PretokenizerType, SpanBatch, SpanIter, pack_pretoken_key,
+    pretoken_key_hash,
 };
 use crate::token::TokenId;
 use eyre::Result;
@@ -88,6 +90,13 @@ pub struct Tokenizer {
     /// would decompose differently (GLM-5.2 has ~97k such words); a plain
     /// merge walk diverges from HF on those.
     ignore_merges: bool,
+    /// Two-level encode plan for SuperBPE tokenizers, installed by
+    /// [`Self::enable_superword_two_level`] and `None` for everything else.
+    /// When set, segments take [`Self::superword_encode_segment`] instead of
+    /// feeding the whole segment to the byte-level merge loop; the token
+    /// stream is identical either way (see [`crate::bpe::superword`]). Boxed
+    /// so the nested stage-1 `Tokenizer` does not make this type recursive.
+    superword: Option<Box<SuperwordPlan>>,
 }
 
 /// NFC-normalize a segment if needed, using `buf` as scratch on the slow path.
@@ -120,6 +129,19 @@ fn nfc_segment<'a>(seg: &'a [u8], buf: &'a mut String) -> &'a [u8] {
 /// values carry the token-arena offset in `val`'s high 32 bits and leave
 /// `ext` unused.
 const VAL_SPILL: u64 = 0x80;
+
+/// Longest pretoken still worth putting in `pretoken_cache_long`.
+///
+/// The long cache pays a full key copy plus arena growth per insert, so it
+/// only earns its keep on pretokens that recur. Past a few hundred bytes
+/// they effectively never do: a pretoken that long is a whole clause or —
+/// under the whitespace-lifted `Superword` scheme — a whole document, and
+/// those are unique. Caching them anyway cost 35 MB of cache for an 8.4 MB
+/// SuperBPE corpus at a hit rate of zero (a *second* pass over the same
+/// documents ran 46x faster, which is the only way that memory ever pays
+/// off, and no real corpus repeats its documents). Encoding is unaffected;
+/// only the memoization is skipped.
+const LONG_CACHE_MAX: usize = 512;
 
 #[inline(always)]
 fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
@@ -339,6 +361,7 @@ impl Tokenizer {
             normalize_nfc: false,
             add_prefix_space: false,
             ignore_merges: false,
+            superword: None,
         }
     }
 
@@ -647,12 +670,19 @@ impl Tokenizer {
         // Still a capacity hint: the table grows past it at 3/4 load on
         // corpora more diverse than the OWT calibration. Clamped to 2^22
         // slots (128 MB) per worker.
-        let distinct = 3.45 * (expected_bytes as f64).powf(0.62);
+        // A two-level (SuperBPE) tokenizer never probes *this* tokenizer's
+        // caches — every pretoken goes through the plan's level-1 tokenizer,
+        // which gets the workload sizing instead (see the fork below). Sizing
+        // both from `expected_bytes` would double a worker's cache footprint
+        // to fill a table nothing reads. The vocab seed still applies, so the
+        // table is built at whatever size seeding needs.
+        let workload_bytes = if self.superword.is_some() { 0 } else { expected_bytes };
+        let distinct = 3.45 * (workload_bytes as f64).powf(0.62);
         let cache_slots = ((distinct * (4.0 / 3.0) * 1.4) as usize)
             .clamp(1 << 16, 1 << 22)
             .next_power_of_two();
-        let arena_cap = (expected_bytes / 256).min(1 << 24);
-        let long_cap = (expected_bytes / 8192).min(1 << 20);
+        let arena_cap = (workload_bytes / 256).min(1 << 24);
+        let long_cap = (workload_bytes / 8192).min(1 << 20);
         let mut token_arena = Vec::with_capacity(arena_cap);
         let mut pretoken_cache = Self::seeded_pretoken_cache(
             &self.vocab,
@@ -697,6 +727,13 @@ impl Tokenizer {
             normalize_nfc: self.normalize_nfc,
             add_prefix_space: self.add_prefix_space,
             ignore_merges: self.ignore_merges,
+            // The level-1 tokenizer carries the bulk of a superword
+            // encode's cache traffic, so a worker's fork gets its own,
+            // sized the same way.
+            superword: self
+                .superword
+                .as_ref()
+                .map(|plan| Box::new(plan.fork_sized(expected_bytes))),
         }
     }
 
@@ -711,6 +748,48 @@ impl Tokenizer {
 
     pub fn pretokenizer_type(&self) -> PretokenizerType {
         self.pretokenizer_type
+    }
+
+    /// Install the SuperBPE two-level encode plan when this tokenizer
+    /// supports it (see [`crate::bpe::superword`]); a no-op otherwise. The
+    /// token stream is unchanged either way — the plan only moves the work
+    /// onto the cached stage-1 path.
+    ///
+    /// Loader-phase mutator, and it must run **last**: it reads the
+    /// pretokenization scheme and `ignore_merges`, so calling it before
+    /// those are set would decide against a plan for the wrong reason (and
+    /// like every mutation it must precede any `WorkerPool` fork).
+    ///
+    /// Declined for:
+    /// - schemes that already split (nothing to recover — the plain path
+    ///   *is* the level-1 path),
+    /// - rank-mapped vocabularies, where merge priority is not the token ID
+    ///   and so the stage-1/stage-2 prefix split does not hold,
+    /// - `ignore_merges`, which lets a whole-pretoken vocab hit bypass the
+    ///   merge loop and so is not reproducible from a merge prefix.
+    pub fn enable_superword_two_level(&mut self) {
+        if !matches!(self.pretokenizer_type, PretokenizerType::Superword)
+            || self.ranked_merges.is_some()
+            || self.ignore_merges
+        {
+            return;
+        }
+        self.superword =
+            SuperwordPlan::build(&self.vocab, &self.merges, self.byte_remapping.as_ref())
+                .map(Box::new);
+    }
+
+    /// The level-1 merge-prefix threshold, for tests and diagnostics.
+    #[cfg(test)]
+    pub(crate) fn superword_threshold(&self) -> Option<u32> {
+        self.superword.as_ref().map(|plan| plan.threshold)
+    }
+
+    /// Force the plain (whole-segment) encode path, so a test can compare it
+    /// against the two-level one.
+    #[cfg(test)]
+    pub(crate) fn disable_superword_two_level(&mut self) {
+        self.superword = None;
     }
 
     /// Enable NFC normalization of non-added-token segments before
@@ -987,7 +1066,11 @@ impl Tokenizer {
     /// This mirrors the full HuggingFace `tokenizers` encode pipeline.
     pub fn encode_with_added_tokens(&mut self, bytes: &[u8], mut f: impl FnMut(&[TokenId])) {
         let pt = self.pretokenizer_type;
+        let two_level = self.superword.is_some();
         self.for_each_piece(bytes, |this, piece| match piece {
+            Piece::Segment(segment, _) if two_level => {
+                this.superword_encode_segment(segment, &mut f)
+            }
             Piece::Segment(segment, _) => this.memoized_encode(pt.pretokenize(segment), &mut f),
             Piece::Added(id) => f(&[id]),
         });
@@ -999,10 +1082,60 @@ impl Tokenizer {
     /// the caller's buffer (the batch engine's per-chunk id buffer).
     pub fn encode_with_added_tokens_flat(&mut self, bytes: &[u8], out: &mut Vec<u32>) {
         let pt = self.pretokenizer_type;
+        let two_level = self.superword.is_some();
         self.for_each_piece(bytes, |this, piece| match piece {
+            Piece::Segment(segment, _) if two_level => {
+                this.superword_encode_segment(segment, |tokens| {
+                    out.extend_from_slice(token_ids_as_u32s(tokens))
+                })
+            }
             Piece::Segment(segment, _) => this.memoized_encode_flat(pt.pretokenize(segment), out),
             Piece::Added(id) => out.push(id.0),
         });
+    }
+
+    /// Two-level SuperBPE encode of one segment, calling `emit` once per
+    /// stage-2 unit (for the whitespace-lifted `Superword` scheme that is
+    /// the whole segment, matching the single pretoken the plain path would
+    /// have produced).
+    ///
+    /// Level 1 splits into [`Level1Units`] and encodes them through the
+    /// stage-1 tokenizer's ordinary cached path — the same probe/emit loop,
+    /// seeded vocab cache and SIMD scan the subword path uses — leaving a
+    /// token stream roughly 4.5x shorter than the byte sequence. Level 2
+    /// then runs the **full** merge table over that stream, so a junction
+    /// pair gets its correct global priority and the superword merges fire.
+    ///
+    /// The token stream is identical to feeding the whole segment to the
+    /// byte-level merge loop; `bpe::superword` documents why, and
+    /// `superword_two_level_matches_single_pretoken` checks it.
+    fn superword_encode_segment(&mut self, segment: &[u8], mut emit: impl FnMut(&[TokenId])) {
+        // Taken out for the duration so the plan's buffers and the level-1
+        // tokenizer can be borrowed alongside this tokenizer's merge tables.
+        let Some(mut plan) = self.superword.take() else { return };
+        for unit in self.pretokenizer_type.pretokenize(segment) {
+            plan.level1.clear();
+            plan.stage1.memoized_encode_flat(
+                SpanIter(Level1Units::new(unit.0, plan.stage1_scheme)),
+                &mut plan.level1,
+            );
+            plan.symbols.clear();
+            plan.symbols.extend(plan.level1.iter().copied().map(TokenId::from));
+            match self.pair_ranks.as_deref() {
+                Some(table) => bpe_merge_symbols_by_rank(
+                    &|a, b| table.rank(a, b),
+                    &mut plan.symbols,
+                    &mut self.merge_scratch,
+                ),
+                None => bpe_merge_symbols_with_scratch(
+                    &self.merges,
+                    &mut plan.symbols,
+                    &mut self.merge_scratch,
+                ),
+            }
+            emit(&plan.symbols);
+        }
+        self.superword = Some(plan);
     }
 
     /// For each pretoken in the input iterator, looks up the string in the
@@ -1284,10 +1417,12 @@ impl Tokenizer {
                 }
                 bpe_merge_symbols_ranked(&rm, symbols);
             }
-            let len = symbols.len() as u32;
-            let offset = self.token_arena.len() as u32;
-            self.token_arena.extend_from_slice(symbols);
-            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            if bytes.len() <= LONG_CACHE_MAX {
+                let len = symbols.len() as u32;
+                let offset = self.token_arena.len() as u32;
+                self.token_arena.extend_from_slice(symbols);
+                self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            }
             out.extend_from_slice(token_ids_as_u32s(symbols));
         }
     }
@@ -1375,10 +1510,12 @@ impl Tokenizer {
                     ),
                 }
             }
-            let len = symbols.len() as u32;
-            let offset = self.token_arena.len() as u32;
-            self.token_arena.extend_from_slice(symbols);
-            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            if bytes.len() <= LONG_CACHE_MAX {
+                let len = symbols.len() as u32;
+                let offset = self.token_arena.len() as u32;
+                self.token_arena.extend_from_slice(symbols);
+                self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            }
             out.extend_from_slice(token_ids_as_u32s(symbols));
         }
     }
@@ -1583,6 +1720,111 @@ mod tests {
         assert!(fork.pair_ranks.is_some());
     }
 
+    /// A committed tokenizer.json, by repo-relative path.
+    fn repo_file(rel: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    /// The committed 50k SuperBPE artifact, trained with `vocab_size = 50000`
+    /// and `transition_point = 40000` and no special tokens — so its first
+    /// superword token ID is exactly 40000.
+    const SUPERBPE_ARTIFACT: &str = "benchmarks/superbpe/artifacts/ours_superbpe.json";
+
+    /// Corpus for the two-level differential: prose the artifact's superword
+    /// merges actually fire on, plus the whitespace shapes whose stage-1
+    /// junctions are the one hazard `Level1Units` has to glue (a plain
+    /// stage-1 split diverges on `"x  y"`), plus non-ASCII and enough text
+    /// to cross a `PRETOKEN_CHUNK` boundary in level 1.
+    const SUPERWORD_CASES: &[&str] = &[
+        "In the United States of the world, one of the most important things is that \
+         the government of the people should be able to do it.",
+        "x  y",
+        "a   b",
+        "a    b    c",
+        "hello  world  foo  bar",
+        "the  quick   brown    fox",
+        "line one\n\nline two\n\n\nline three",
+        "x\t\ty",
+        " \n \n ",
+        "  leading and trailing  ",
+        "def f():\n    return  1\n\n    # comment  here\n",
+        "caf\u{e9} na\u{ef}ve \u{fc}ber \u{e9}l\u{e8}ve",
+        "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{ff0c}\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}",
+        "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} \u{92e}\u{947}\u{902} \u{932}\u{93f}\u{916}\u{93e}",
+        "word  ,  word ;; word -- word",
+        "1  2   34    567  8901",
+        // The contraction hazard: `("'", "s")` is a low-ID merge because
+        // `'s` is its own pretoken, yet a greedy punctuation run takes the
+        // apostrophe in `"x!'s"` and puts a boundary between them. Before
+        // `Level1Units` glued apostrophe-final units, the derived threshold
+        // collapsed from 40000 to 424 on exactly these.
+        "x!'s",
+        "!'s and !'t and !'ll",
+        "\"'s\" ('ve) [!'re]",
+        "don't can't y'all it's O'Brien",
+        "''s '''t",
+        "",
+        " ",
+        "\n",
+    ];
+
+    /// Two-level SuperBPE encoding must be token-for-token identical to
+    /// feeding each whole segment to the byte-level merge loop — the plain
+    /// path, and what `ByteLevel(use_regex=false)` means in HF `tokenizers`.
+    /// The speedup comes from moving work onto the cached stage-1 path, not
+    /// from changing the answer.
+    #[test]
+    fn superword_two_level_matches_single_pretoken() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let path = repo_file(SUPERBPE_ARTIFACT);
+        let mut two_level = load_hf_bpe(&path).expect("load SuperBPE artifact");
+        assert_eq!(
+            two_level.superword_threshold(),
+            Some(40_000),
+            "derived threshold must be the artifact's transition point"
+        );
+        let mut plain = load_hf_bpe(&path).expect("load SuperBPE artifact");
+        plain.disable_superword_two_level();
+        assert_eq!(plain.superword_threshold(), None);
+
+        let long = SUPERWORD_CASES.join(" ").repeat(40);
+        for case in SUPERWORD_CASES.iter().copied().chain([long.as_str()]) {
+            let mut got: Vec<u32> = Vec::new();
+            let mut want: Vec<u32> = Vec::new();
+            two_level.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+            plain.encode_with_added_tokens_flat(case.as_bytes(), &mut want);
+            assert_eq!(
+                got,
+                want,
+                "two-level diverged on {:?}\n  two-level: {:?}\n  plain:     {:?}",
+                &case[..case.len().min(120)],
+                got.iter()
+                    .map(|&id| String::from_utf8_lossy(&two_level.vocab[id as usize]).into_owned())
+                    .collect::<Vec<_>>(),
+                want.iter()
+                    .map(|&id| String::from_utf8_lossy(&plain.vocab[id as usize]).into_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// A plain BPE tokenizer has no superword merges — every merge stays
+    /// inside one stage-1 pretoken — so there is no transition to derive and
+    /// no plan to install. Guards against the threshold being inferred from
+    /// something incidental (a special token's contents, say) and quietly
+    /// splitting an ordinary tokenizer's encode in two.
+    #[test]
+    fn plain_bpe_gets_no_superword_plan() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        for rel in [
+            "benchmarks/superbpe/artifacts/ours_bpe.json",
+            "tests/fixtures/gpt2_tokenizer.json",
+        ] {
+            let tok = load_hf_bpe(repo_file(rel)).expect("load plain BPE tokenizer");
+            assert_eq!(tok.superword_threshold(), None, "{rel} must get no plan");
+        }
+    }
+
     #[test]
     fn short_pretoken_cache_serves_repeated_pretokens() {
         use crate::pretokenize::{SpanIter, pack_pretoken_key, pretoken_key_hash};
@@ -1758,6 +2000,76 @@ mod verify_heavy {
             input.pop();
         }
         input
+    }
+
+    /// Split a corpus slice on the document separator, the way the batch
+    /// engine does before a segment reaches the encode path.
+    fn split_docs<'a>(input: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
+        let mut docs = Vec::new();
+        let mut last = 0;
+        for at in memchr::memmem::find_iter(input, sep) {
+            if at > last {
+                docs.push(&input[last..at]);
+            }
+            last = at + sep.len();
+        }
+        if last < input.len() {
+            docs.push(&input[last..]);
+        }
+        docs
+    }
+
+    /// Two-level SuperBPE encoding vs the plain whole-segment path on real
+    /// OWT: the same binary, the same process, back to back, so the only
+    /// difference is which path runs. Asserts the two agree token-for-token
+    /// over the whole slice — the large-scale counterpart to
+    /// `superword_two_level_matches_single_pretoken`'s hand-picked cases —
+    /// and reports throughput for both.
+    ///
+    /// `#[ignore]`d: it needs ~/data/owt_train.txt, and its timings only mean
+    /// something in release. Run with
+    /// `cargo test --release --lib bench_superword -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_superword_two_level_vs_plain() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("benchmarks/superbpe/artifacts/ours_superbpe.json");
+        let input = load_owt(32 << 20);
+        let docs = split_docs(&input, b"<|endoftext|>");
+        let bytes: usize = docs.iter().map(|d| d.len()).sum();
+
+        let mut two_level = load_hf_bpe(&path).expect("load SuperBPE artifact");
+        assert!(
+            two_level.superword_threshold().is_some(),
+            "two-level plan must be installed, or this measures nothing"
+        );
+        let mut plain = load_hf_bpe(&path).expect("load SuperBPE artifact");
+        plain.disable_superword_two_level();
+
+        let mut results = Vec::new();
+        for (label, tok) in [("two-level", &mut two_level), ("plain", &mut plain)] {
+            let mut out: Vec<u32> = Vec::new();
+            let start = std::time::Instant::now();
+            for doc in &docs {
+                tok.encode_with_added_tokens_flat(doc, &mut out);
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!(
+                "{label:>10}: {:8.1} MB/s  ({:.2} s for {:.1} MB, {} tokens, {:.2} bytes/token)",
+                bytes as f64 / 1e6 / elapsed,
+                elapsed,
+                bytes as f64 / 1e6,
+                out.len(),
+                bytes as f64 / out.len() as f64,
+            );
+            results.push((label, out, bytes as f64 / 1e6 / elapsed));
+        }
+        assert_eq!(
+            results[0].1, results[1].1,
+            "two-level and plain must produce identical tokens over {} docs",
+            docs.len()
+        );
+        eprintln!("  speedup: {:.2}x", results[0].2 / results[1].2);
     }
 
     /// Cut `input` at the first newline at or after `at` (whole input if none).

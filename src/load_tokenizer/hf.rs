@@ -793,6 +793,10 @@ fn build_bpe(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
             })
             .collect(),
     );
+    // Last, by contract: it reads the scheme and `ignore_merges` set above.
+    // A no-op unless this is a SuperBPE tokenizer, and never changes the
+    // token stream — see `bpe::superword`.
+    tokenizer.enable_superword_two_level();
     Ok(tokenizer)
 }
 

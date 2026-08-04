@@ -82,6 +82,21 @@ PARITY_TEXTS = [
     "1234567890",
     "the end of the beginning\nof the story",
     "mixed the United States 世界 case",
+    # Junction hazards for the two-level encode (see src/bpe/superword.rs).
+    # gigatoken encodes a SuperBPE tokenizer by splitting at stage-1 pretoken
+    # boundaries first, which is only sound where no low-ID merge can span the
+    # boundary. Two shapes can: a whitespace run, which the `\s+(?!\S)`
+    # lookahead cuts mid-run, and an apostrophe, which the contraction
+    # alternative makes its own pretoken while a greedy punctuation run
+    # swallows it. Both diverged from HF before the splitter glued them.
+    "x  y",
+    "a   b    c",
+    "the  quick   brown    fox",
+    "x\t\ty and a \n b",
+    "x!'s and !'t and !'ll",
+    "don't can't y'all it's O'Brien",
+    "''s '''t \"'ve\" ('re)",
+    "def f():\n    return  1\n\n    # two  spaces\n",
 ]
 
 
