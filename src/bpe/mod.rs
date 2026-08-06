@@ -333,31 +333,47 @@ pub fn bpe_merge_symbols_with_scratch<S: std::hash::BuildHasher>(
     );
 }
 
-/// Shared merge loop, generic over the pair-rank lookup: `get_rank` returns
-/// the merged token's ID (== merge priority for tiktoken-style vocabs) or
-/// `u32::MAX` when the pair does not merge.
-// Out of line: this only runs on pretoken-cache misses (~0.7% of
-// pretokens on OWT), and inlining its bulk into the encode loop costs
-// more in I-cache and register pressure there than a call costs here.
-#[inline(never)]
+/// [`bpe_merge_symbols_by_rank_slice`] merging a whole `Vec` in place,
+/// truncating it to the survivors.
+#[inline]
 pub(crate) fn bpe_merge_symbols_by_rank(
     get_rank: &impl Fn(TokenId, TokenId) -> u32,
     symbols: &mut Vec<TokenId>,
     scratch: &mut MergeScratch,
 ) {
+    let kept = bpe_merge_symbols_by_rank_slice(get_rank, symbols, scratch);
+    symbols.truncate(kept);
+}
+
+/// Shared merge loop, generic over the pair-rank lookup: `get_rank` returns
+/// the merged token's ID (== merge priority for tiktoken-style vocabs) or
+/// `u32::MAX` when the pair does not merge.
+///
+/// Merges `symbols` in place and returns the surviving count, compacted to the
+/// front — so a caller holding one buffer of independent runs (the superword
+/// two-level encode's inert-boundary segments, `bpe::superword`) can merge each
+/// run without copying it out.
+// Out of line: this only runs on pretoken-cache misses (~0.7% of
+// pretokens on OWT), and inlining its bulk into the encode loop costs
+// more in I-cache and register pressure there than a call costs here.
+#[inline(never)]
+pub(crate) fn bpe_merge_symbols_by_rank_slice(
+    get_rank: &impl Fn(TokenId, TokenId) -> u32,
+    symbols: &mut [TokenId],
+    scratch: &mut MergeScratch,
+) -> usize {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
     let n = symbols.len();
     if n < 2 {
-        return;
+        return n;
     }
 
     // For short sequences (the overwhelming majority of pretokens), a linear
     // rank scan has far lower constants than heap + linked list.
     if n <= SMALL_MERGE_MAX {
-        bpe_merge_symbols_small(get_rank, symbols);
-        return;
+        return bpe_merge_symbols_small_slice(get_rank, symbols);
     }
 
     // Doubly-linked list via u32 index arrays (pretokens are far shorter than
@@ -443,11 +459,11 @@ pub(crate) fn bpe_merge_symbols_by_rank(
         }
         i = next[i] as usize;
     }
-    symbols.truncate(write);
+    write
 }
 
 /// Sequences up to this length use the linear-scan merge instead of the heap.
-const SMALL_MERGE_MAX: usize = 32;
+pub(crate) const SMALL_MERGE_MAX: usize = 32;
 
 /// BPE merge for short sequences (n <= SMALL_MERGE_MAX), in the style of
 /// tiktoken's `byte_pair_merge`: keep a per-position rank (the merged token ID
@@ -458,15 +474,19 @@ const SMALL_MERGE_MAX: usize = 32;
 /// identical to the heap version's ordering.
 ///
 /// One of three deliberately separate small-merge cores with disjoint
-/// domains: this Vec-based one handles 16..=32 symbols via
-/// `bpe_merge_symbols_by_rank` (the long-pretoken miss path); pretokens of
+/// domains: this one handles 16..=32 symbols via
+/// `bpe_merge_symbols_by_rank` (the long-pretoken miss path) and every
+/// inert-boundary run of the superword two-level encode; pretokens of
 /// <= 15 symbols go straight to `bpe_merge_symbols_short_scalar` /
 /// `bpe_merge_symbols_short_neon`. Unifying them was measured as a
 /// regression risk to the tuned short-miss path.
-fn bpe_merge_symbols_small(
+///
+/// Merges in place and returns the surviving count, compacted to the front of
+/// `symbols` — see [`bpe_merge_symbols_by_rank_slice`] for why the slice shape.
+pub(crate) fn bpe_merge_symbols_small_slice(
     get_rank: &impl Fn(TokenId, TokenId) -> u32,
-    symbols: &mut Vec<TokenId>,
-) {
+    symbols: &mut [TokenId],
+) -> usize {
     let n = symbols.len();
     debug_assert!((2..=SMALL_MERGE_MAX).contains(&n));
     // Stack-resident doubly-linked list, so a merge is O(1) pointer updates
@@ -524,21 +544,21 @@ fn bpe_merge_symbols_small(
         write += 1;
         i = next[i] as usize;
     }
-    symbols.truncate(write);
+    write
 }
 
 /// Symbol capacity of the stack-array short merges: short pretokens are
 /// ≤ 15 bytes, so at most 15 initial symbols.
 pub(crate) const SHORT_MERGE_MAX: usize = 16;
 
-/// [`bpe_merge_symbols_small`] over a caller-owned stack array instead of
+/// [`bpe_merge_symbols_small_slice`] over a caller-owned stack array instead of
 /// the `Vec` scratch (no bounds/capacity code, no extend memmove) — the
 /// short-pretoken miss path's merge. Returns the merged length.
 ///
 /// The non-aarch64 core of the short-miss domain (<= 15 symbols, called
 /// from the tiktoken encode loop); aarch64 uses
 /// [`bpe_merge_symbols_short_neon`] when a [`PairRankTable`] is available.
-/// Kept separate from the Vec-based [`bpe_merge_symbols_small`] (16..=32
+/// Kept separate from [`bpe_merge_symbols_small_slice`] (16..=32
 /// symbols): the domains are disjoint and unification was measured as a
 /// regression risk to this tuned miss path.
 ///
@@ -553,7 +573,7 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
     n: usize,
 ) -> usize {
     debug_assert!((2..=SHORT_MERGE_MAX - 1).contains(&n));
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small_slice`.
     let mut next = [0u8; SHORT_MERGE_MAX];
     let mut prev = [0u8; SHORT_MERGE_MAX];
     for i in 0..n {
@@ -642,7 +662,7 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
 /// The aarch64 core of the short-miss domain (<= 15 symbols, called from
 /// the tiktoken encode loop); other arches use
 /// [`bpe_merge_symbols_short_scalar`], and 16..=32-symbol sequences take
-/// the Vec-based [`bpe_merge_symbols_small`] — the three are deliberately
+/// [`bpe_merge_symbols_small_slice`] — the three are deliberately
 /// not unified (disjoint domains; see `bpe_merge_symbols_short_scalar`).
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn bpe_merge_symbols_short_neon(
@@ -655,7 +675,7 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     /// Every packed value at or above this has rank u32::MAX (no merge).
     const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
     let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small_slice`.
     let mut next = [0u8; SHORT_MERGE_MAX];
     let mut prev = [0u8; SHORT_MERGE_MAX];
     for i in 0..n {
@@ -751,7 +771,7 @@ fn bpe_merge_symbols_short_avx512(
     /// Every packed value at or above this has rank u32::MAX (no merge).
     const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
     let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small_slice`.
     let mut next = [0u8; SHORT_MERGE_MAX];
     let mut prev = [0u8; SHORT_MERGE_MAX];
     for i in 0..n {
@@ -824,7 +844,7 @@ fn bpe_merge_symbols_short_avx2(
     /// Every packed value at or above this has rank u32::MAX (no merge).
     const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
     let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small_slice`.
     let mut next = [0u8; SHORT_MERGE_MAX];
     let mut prev = [0u8; SHORT_MERGE_MAX];
     for i in 0..n {
@@ -913,7 +933,7 @@ pub fn ranked_merge_key(a: TokenId, b: TokenId) -> u64 {
     ((a.0 as u64) << 32) | b.0 as u64
 }
 
-/// Ranked-merge variant of [`bpe_merge_symbols_small`]: allocation-free BPE
+/// Ranked-merge variant of [`bpe_merge_symbols_small_slice`]: allocation-free BPE
 /// for short symbol sequences (the overwhelming majority of cache-missing
 /// units), with priority taken from the merge table's explicit rank. Also
 /// the stack-buffer miss path of the ByteLevel tokenizer for rank-mapped
@@ -930,7 +950,7 @@ pub(crate) fn bpe_merge_symbols_ranked_slice<S: std::hash::BuildHasher>(
     };
     let n = symbols.len();
     debug_assert!((2..=SMALL_MERGE_MAX).contains(&n));
-    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small_slice`.
     let mut next = [0u8; SMALL_MERGE_MAX];
     let mut prev = [0u8; SMALL_MERGE_MAX];
     for i in 0..n {

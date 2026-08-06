@@ -1,8 +1,9 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
 use crate::bpe::superword::{Level1Units, SuperwordPlan};
 use crate::bpe::{
-    ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, bpe_merge_symbols_by_rank,
-    bpe_merge_symbols_ranked, bpe_merge_symbols_ranked_slice, bpe_merge_symbols_short_scalar,
+    ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, SMALL_MERGE_MAX,
+    bpe_merge_symbols_by_rank, bpe_merge_symbols_by_rank_slice, bpe_merge_symbols_ranked,
+    bpe_merge_symbols_ranked_slice, bpe_merge_symbols_short_scalar, bpe_merge_symbols_small_slice,
     bpe_merge_symbols_with_scratch, simple_bpe_merge,
 };
 #[cfg(target_arch = "aarch64")]
@@ -169,6 +170,23 @@ fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
 fn token_ids_as_u32s(toks: &[TokenId]) -> &[u32] {
     // SAFETY: TokenId is #[repr(transparent)] over u32.
     unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u32, toks.len()) }
+}
+
+/// [`token_ids_as_u32s`] in the other direction, so the superword two-level
+/// encode can hold one buffer that level 1 fills as raw ids and level 2 merges
+/// as `TokenId`s, instead of copying between two.
+#[inline(always)]
+fn u32s_as_token_ids(ids: &[u32]) -> &[TokenId] {
+    // SAFETY: TokenId is #[repr(transparent)] over u32, and every u32 is a
+    // valid TokenId (it is a plain newtype with no niche).
+    unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const TokenId, ids.len()) }
+}
+
+/// [`u32s_as_token_ids`] for in-place merging.
+#[inline(always)]
+fn u32s_as_token_ids_mut(ids: &mut [u32]) -> &mut [TokenId] {
+    // SAFETY: as above; the exclusive borrow of `ids` carries over.
+    unsafe { std::slice::from_raw_parts_mut(ids.as_mut_ptr() as *mut TokenId, ids.len()) }
 }
 
 /// Unpack an inline value's four token lanes (lanes past the count are
@@ -774,15 +792,61 @@ impl Tokenizer {
         {
             return;
         }
-        self.superword =
-            SuperwordPlan::build(&self.vocab, &self.merges, self.byte_remapping.as_ref())
-                .map(Box::new);
+        self.superword = SuperwordPlan::build(
+            &self.vocab,
+            &self.vocab_inv,
+            &self.merges,
+            self.byte_remapping.as_ref(),
+        )
+        .map(Box::new);
     }
 
     /// The level-1 merge-prefix threshold, for tests and diagnostics.
     #[cfg(test)]
     pub(crate) fn superword_threshold(&self) -> Option<u32> {
         self.superword.as_ref().map(|plan| plan.threshold)
+    }
+
+    /// Flip the two-level encode's kill switches (see `SuperwordPlan`), so one
+    /// process can A/B the round-2 optimizations against the shapes they
+    /// replaced on one set of tables.
+    #[cfg(test)]
+    pub(crate) fn set_superword_variant(&mut self, buf_fill: bool, use_cuts: bool) {
+        if let Some(plan) = self.superword.as_mut() {
+            plan.buf_fill = buf_fill;
+            plan.use_cuts = use_cuts;
+        }
+    }
+
+    /// Rebuild the two-level plan with its threshold capped, so a bench can
+    /// measure what an unglued hazard costs (see `SuperwordPlan::build_capped`).
+    /// Capping only moves merges from level 1 to level 2, so the token stream is
+    /// unchanged.
+    #[cfg(test)]
+    pub(crate) fn cap_superword_threshold(&mut self, cap: u32) {
+        self.superword = SuperwordPlan::build_capped(
+            &self.vocab,
+            &self.vocab_inv,
+            &self.merges,
+            self.byte_remapping.as_ref(),
+            cap,
+        )
+        .map(Box::new);
+    }
+
+    /// Lengths of the independent runs `SuperwordCuts` splits a level-1 stream
+    /// into, for `report_cut_stats`.
+    #[cfg(test)]
+    pub(crate) fn superword_run_lengths(&mut self, level1: &[u32]) -> Vec<usize> {
+        let Some(plan) = self.superword.as_mut() else { return Vec::new() };
+        let mut lengths = Vec::new();
+        let mut start = 0usize;
+        while start < level1.len() {
+            let end = plan.cuts.run_end(level1, start);
+            lengths.push(end - start);
+            start = end;
+        }
+        lengths
     }
 
     /// Force the plain (whole-segment) encode path, so a test can compare it
@@ -1106,6 +1170,12 @@ impl Tokenizer {
     /// then runs the **full** merge table over that stream, so a junction
     /// pair gets its correct global priority and the superword merges fire.
     ///
+    /// Level 2 does not run over the whole stream at once: `SuperwordCuts`
+    /// identifies the boundaries no merge can cross, and each run between them
+    /// merges independently. That is what puts the merge under the small-merge
+    /// core instead of the heap — see `bpe::superword::SuperwordCuts` for why
+    /// the boundaries are derivable.
+    ///
     /// The token stream is identical to feeding the whole segment to the
     /// byte-level merge loop; `bpe::superword` documents why, and
     /// `superword_two_level_matches_single_pretoken` checks it.
@@ -1114,27 +1184,139 @@ impl Tokenizer {
         // tokenizer can be borrowed alongside this tokenizer's merge tables.
         let Some(mut plan) = self.superword.take() else { return };
         for unit in self.pretokenizer_type.pretokenize(segment) {
-            plan.level1.clear();
-            plan.stage1.memoized_encode_flat(
-                SpanIter(Level1Units::new(unit.0, plan.stage1_scheme)),
-                &mut plan.level1,
-            );
             plan.symbols.clear();
-            plan.symbols.extend(plan.level1.iter().copied().map(TokenId::from));
-            match self.pair_ranks.as_deref() {
-                Some(table) => bpe_merge_symbols_by_rank(
-                    &|a, b| table.rank(a, b),
+            // Two fill shapes, selected once per unit (see `SuperwordPlan`'s
+            // kill switches): the generic iterator fill, and the buffer-backed
+            // `PretokenSpans` impl that measured slower than it.
+            if plan.buf_fill {
+                plan.stage1.memoized_encode_flat(
+                    Level1Units::new(unit.0, plan.stage1_scheme),
                     &mut plan.symbols,
-                    &mut self.merge_scratch,
-                ),
-                None => bpe_merge_symbols_with_scratch(
-                    &self.merges,
+                );
+            } else {
+                plan.stage1.memoized_encode_flat(
+                    SpanIter(Level1Units::new(unit.0, plan.stage1_scheme)),
                     &mut plan.symbols,
-                    &mut self.merge_scratch,
-                ),
+                );
             }
-            emit(&plan.symbols);
+            match self.pair_ranks.as_deref() {
+                Some(table) => Self::superword_merge(
+                    &mut plan,
+                    &|a, b| table.rank(a, b),
+                    &mut self.merge_scratch,
+                ),
+                None => {
+                    let merges = &self.merges;
+                    Self::superword_merge(
+                        &mut plan,
+                        &|a, b| merges.get(&(a, b)).map_or(u32::MAX, |m| m.0),
+                        &mut self.merge_scratch,
+                    )
+                }
+            }
+            emit(u32s_as_token_ids(&plan.symbols));
         }
+        self.superword = Some(plan);
+    }
+
+    /// Level 2 of [`Self::superword_encode_segment`]: merge `plan.symbols` in
+    /// place, run by independent run.
+    ///
+    /// Runs are merged left to right with survivors compacted forward. A run's
+    /// survivor count never exceeds its length, so the write cursor stays at or
+    /// behind every run's start and can never overtake a run still to be read —
+    /// which is also what lets `SuperwordCuts::run_end` find the next boundary
+    /// on pristine symbols as it goes.
+    fn superword_merge(
+        plan: &mut SuperwordPlan,
+        get_rank: &impl Fn(TokenId, TokenId) -> u32,
+        scratch: &mut MergeScratch,
+    ) {
+        let symbols = u32s_as_token_ids_mut(&mut plan.symbols);
+        if !plan.use_cuts {
+            let kept = bpe_merge_symbols_by_rank_slice(get_rank, symbols, scratch);
+            plan.symbols.truncate(kept);
+            return;
+        }
+        let n = plan.symbols.len();
+        let mut write = 0usize;
+        let mut start = 0usize;
+        while start < n {
+            let end = plan.cuts.run_end(&plan.symbols, start);
+            debug_assert!(write <= start);
+            let symbols = u32s_as_token_ids_mut(&mut plan.symbols);
+            let kept = match end - start {
+                1 => 1,
+                len if len <= SMALL_MERGE_MAX => {
+                    bpe_merge_symbols_small_slice(get_rank, &mut symbols[start..end])
+                }
+                _ => bpe_merge_symbols_by_rank_slice(get_rank, &mut symbols[start..end], scratch),
+            };
+            if write != start {
+                // Runs average ~2 symbols, and `copy_within` lowers to a
+                // `memmove` call — one per run, which at 3.9 M runs per 33 MB
+                // costs more than the copy itself. `write < start` here and the
+                // copy runs forward, so it cannot clobber a source element.
+                for k in 0..kept {
+                    plan.symbols[write + k] = plan.symbols[start + k];
+                }
+            }
+            write += kept;
+            start = end;
+        }
+        plan.symbols.truncate(write);
+    }
+
+    /// Level 1 of [`Self::superword_encode_segment`] with the merge omitted:
+    /// the [`Level1Units`] walk and the cached stage-1 encode, appending the
+    /// level-1 token stream to `out`.
+    ///
+    /// The two-level encode's cost splits cleanly in two, and this box has no
+    /// sampling profiler, so `bench_superword_two_level_vs_plain` recovers the
+    /// split by *subtraction*: this arm times level 1, and
+    /// [`Self::superword_level2_only`] replays the streams it produced through
+    /// the merge. Neither arm produces the tokenizer's output, so neither is
+    /// reachable outside that measurement.
+    #[cfg(test)]
+    pub(crate) fn superword_level1_only(&mut self, segment: &[u8], out: &mut Vec<u32>) {
+        let Some(mut plan) = self.superword.take() else { return };
+        for unit in self.pretokenizer_type.pretokenize(segment) {
+            if plan.buf_fill {
+                plan.stage1
+                    .memoized_encode_flat(Level1Units::new(unit.0, plan.stage1_scheme), out);
+            } else {
+                plan.stage1.memoized_encode_flat(
+                    SpanIter(Level1Units::new(unit.0, plan.stage1_scheme)),
+                    out,
+                );
+            }
+        }
+        self.superword = Some(plan);
+    }
+
+    /// Level 2 of [`Self::superword_encode_segment`] on a level-1 stream
+    /// [`Self::superword_level1_only`] produced earlier — the merge cost with
+    /// the fill cost removed. See that method for why the split is measured
+    /// this way.
+    #[cfg(test)]
+    pub(crate) fn superword_level2_only(&mut self, level1: &[u32], out: &mut Vec<u32>) {
+        let Some(mut plan) = self.superword.take() else { return };
+        plan.symbols.clear();
+        plan.symbols.extend_from_slice(level1);
+        match self.pair_ranks.as_deref() {
+            Some(table) => {
+                Self::superword_merge(&mut plan, &|a, b| table.rank(a, b), &mut self.merge_scratch)
+            }
+            None => {
+                let merges = &self.merges;
+                Self::superword_merge(
+                    &mut plan,
+                    &|a, b| merges.get(&(a, b)).map_or(u32::MAX, |m| m.0),
+                    &mut self.merge_scratch,
+                )
+            }
+        }
+        out.extend_from_slice(&plan.symbols);
         self.superword = Some(plan);
     }
 
@@ -1763,6 +1945,20 @@ mod tests {
         "\"'s\" ('ve) [!'re]",
         "don't can't y'all it's O'Brien",
         "''s '''t",
+        // The contraction *tail* hazard, the same alternative from the other
+        // side: `'s` being its own pretoken puts a boundary before the letters
+        // after it, making `("s","t")` — merge 303 — hazardous. Ungluing these
+        // held the derived threshold at 381 and made two-level slower than
+        // plain.
+        "'st",
+        "'se 'ter 'ment 'res 'vel",
+        "it'style and can'ther",
+        // Digit-run hazards: `superbpe_stage1`'s bare `\p{N}{1,3}` splits `" 1"`
+        // (merge 381) and cuts long runs every three digits (`"0000"`, 939).
+        "1  2   34    567  8901",
+        "0000 00000 123456789",
+        " 2016 and 2015 and 20164",
+        "COVID-19 v1.2.3 x42y7",
         "",
         " ",
         "\n",
@@ -1804,6 +2000,97 @@ mod tests {
                 want.iter()
                     .map(|&id| String::from_utf8_lossy(&plain.vocab[id as usize]).into_owned())
                     .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// Each of the four two-level variants — buffer-backed vs iterator fill ×
+    /// inert-boundary cuts vs whole-stream merge — must produce the same tokens.
+    ///
+    /// The variants are performance switches only, so any divergence localises
+    /// the bug immediately: a fill difference means `Level1Units`' offset walk
+    /// disagrees with its slice walk, a cut difference means `SuperwordCuts`
+    /// cleared a boundary a merge can actually cross.
+    #[test]
+    fn superword_variants_agree() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let mut tok = load_hf_bpe(repo_file(SUPERBPE_ARTIFACT)).expect("load SuperBPE artifact");
+        let long = SUPERWORD_CASES.join(" ").repeat(40);
+        for case in SUPERWORD_CASES.iter().copied().chain([long.as_str()]) {
+            let mut want: Vec<u32> = Vec::new();
+            tok.set_superword_variant(false, false);
+            tok.encode_with_added_tokens_flat(case.as_bytes(), &mut want);
+            for (buf_fill, use_cuts) in [(false, true), (true, false), (true, true)] {
+                let mut got: Vec<u32> = Vec::new();
+                tok.set_superword_variant(buf_fill, use_cuts);
+                tok.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+                assert_eq!(
+                    got,
+                    want,
+                    "buf_fill={buf_fill} use_cuts={use_cuts} diverged on {:?}",
+                    &case[..case.len().min(120)],
+                );
+            }
+        }
+    }
+
+    /// The ASCII fast lanes in `Level1Units`' glue test must agree with the
+    /// decode they short-circuit, on every single byte and on multi-byte tails.
+    /// Whitespace decides where level 1 splits, so a disagreement here changes
+    /// the derived threshold and the level-1 unit shapes.
+    #[test]
+    fn boundary_whitespace_matches_decode() {
+        // The pre-fast-lane implementations, verbatim.
+        fn ends_decode(s: &[u8]) -> bool {
+            for k in 1..=4.min(s.len()) {
+                if let Ok(tail) = std::str::from_utf8(&s[s.len() - k..]) {
+                    return tail.chars().next_back().is_some_and(char::is_whitespace);
+                }
+            }
+            true
+        }
+        fn starts_decode(s: &[u8]) -> bool {
+            for k in 1..=4.min(s.len()) {
+                if let Ok(head) = std::str::from_utf8(&s[..k]) {
+                    return head.chars().next().is_some_and(char::is_whitespace);
+                }
+            }
+            true
+        }
+
+        let mut cases: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        cases.push(Vec::new());
+        // Every single byte in both positions of a two-byte string, plus the
+        // non-ASCII whitespace codepoints and a few malformed tails.
+        for b in 0..=255u8 {
+            cases.push(vec![b'x', b]);
+            cases.push(vec![b, b'x']);
+        }
+        const NON_ASCII: [char; 7] =
+            ['\u{a0}', '\u{1680}', '\u{2028}', '\u{2029}', '\u{3000}', '\u{feff}', '\u{4e16}'];
+        for c in NON_ASCII {
+            let mut s = String::from("x");
+            s.push(c);
+            cases.push(s.clone().into_bytes());
+            cases.push(format!("{c}x").into_bytes());
+            cases.push(c.to_string().into_bytes());
+            // Truncated encodings of the same character.
+            let bytes = c.to_string().into_bytes();
+            for k in 1..bytes.len() {
+                cases.push(bytes[..k].to_vec());
+                cases.push(bytes[k..].to_vec());
+            }
+        }
+        for case in &cases {
+            assert_eq!(
+                crate::bpe::superword::ends_with_whitespace_for_test(case),
+                ends_decode(case),
+                "ends_with_whitespace on {case:?}"
+            );
+            assert_eq!(
+                crate::bpe::superword::starts_with_whitespace_for_test(case),
+                starts_decode(case),
+                "starts_with_whitespace on {case:?}"
             );
         }
     }
@@ -2026,17 +2313,33 @@ mod verify_heavy {
     /// `superword_two_level_matches_single_pretoken`'s hand-picked cases —
     /// and reports throughput for both.
     ///
+    /// Reported as min-of-N per arm, arms run to completion one after another,
+    /// per the campaign protocol in `profiling/campaign_report.md` §2. This
+    /// bench varies several % run to run and this box's thermal state after a
+    /// long compile is worth more than that, so never compare numbers across
+    /// sessions — A/B variants inside one process (that is what the
+    /// `GIGATOK_SUPERWORD_*` switches are for) or it did not happen.
+    ///
+    /// Deliberately loads only the two tokenizers it measures. Each holds its
+    /// own 16 MiB dense `PairRankTable` and seeded pretoken cache, so a third
+    /// resident tokenizer — or interleaving a differently-shaped arm between
+    /// rounds — measures cache eviction instead of encoding. That mistake cost
+    /// a full measurement session: adding phase arms to this test read as
+    /// two-level 12.3 / plain 15.0 MB/s where the isolated arms give 28.5 /
+    /// 10.7. The phase decomposition lives in its own process, in
+    /// `bench_superword_phase_split`.
+    ///
     /// `#[ignore]`d: it needs ~/data/owt_train.txt, and its timings only mean
     /// something in release. Run with
-    /// `cargo test --release --lib bench_superword -- --ignored --nocapture`.
+    /// `cargo test --release --lib bench_superword_two_level -- --ignored --nocapture`.
+    /// `SUPERBPE_BENCH_MB` (default 32) and `SUPERBPE_BENCH_ROUNDS` (default 5)
+    /// size the slice and the round count.
     #[test]
     #[ignore]
     fn bench_superword_two_level_vs_plain() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("benchmarks/superbpe/artifacts/ours_superbpe.json");
-        let input = load_owt(32 << 20);
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
         let docs = split_docs(&input, b"<|endoftext|>");
-        let bytes: usize = docs.iter().map(|d| d.len()).sum();
+        let path = superbpe_artifact();
 
         let mut two_level = load_hf_bpe(&path).expect("load SuperBPE artifact");
         assert!(
@@ -2048,28 +2351,322 @@ mod verify_heavy {
 
         let mut results = Vec::new();
         for (label, tok) in [("two-level", &mut two_level), ("plain", &mut plain)] {
-            let mut out: Vec<u32> = Vec::new();
-            let start = std::time::Instant::now();
-            for doc in &docs {
-                tok.encode_with_added_tokens_flat(doc, &mut out);
+            let mut best = 0.0f64;
+            let mut kept: Vec<u32> = Vec::new();
+            for round in 0..rounds {
+                let mut out: Vec<u32> = Vec::new();
+                let start = std::time::Instant::now();
+                for doc in &docs {
+                    tok.encode_with_added_tokens_flat(doc, &mut out);
+                }
+                best = best.max(mbytes / start.elapsed().as_secs_f64());
+                if round == 0 {
+                    kept = out;
+                }
             }
-            let elapsed = start.elapsed().as_secs_f64();
+            let bytes_per_token = mbytes * 1e6 / kept.len() as f64;
             eprintln!(
-                "{label:>10}: {:8.1} MB/s  ({:.2} s for {:.1} MB, {} tokens, {:.2} bytes/token)",
-                bytes as f64 / 1e6 / elapsed,
-                elapsed,
-                bytes as f64 / 1e6,
-                out.len(),
-                bytes as f64 / out.len() as f64,
+                "{label:>10}: {best:8.1} MB/s  ({mbytes:.1} MB, {} tokens, \
+                 {bytes_per_token:.2} bytes/token, min of {rounds})",
+                kept.len(),
             );
-            results.push((label, out, bytes as f64 / 1e6 / elapsed));
+            results.push((label, kept, best));
         }
         assert_eq!(
             results[0].1, results[1].1,
             "two-level and plain must produce identical tokens over {} docs",
             docs.len()
         );
-        eprintln!("  speedup: {:.2}x", results[0].2 / results[1].2);
+        eprintln!("  two-level is {:.2}x the plain path", results[0].2 / results[1].2);
+    }
+
+    /// Where the two-level encode's time goes, in its own process so it
+    /// perturbs nothing (see `bench_superword_two_level_vs_plain`).
+    ///
+    /// There is no sampling profiler on every target this runs on, so the split
+    /// is taken by subtraction from three arms over **one** tokenizer — its
+    /// tables are the working set the real path has:
+    ///
+    /// - `full`: the shipped two-level encode.
+    /// - `level 1`: the `Level1Units` walk and the cached stage-1 encode, merge
+    ///   omitted.
+    /// - `level 2`: the merge alone, replaying level-1 streams collected up
+    ///   front. Faithful in instruction mix but not in memory layout — it reads
+    ///   the streams from a retained ~80 MB of `Vec`s instead of from the
+    ///   L1-hot buffer the real path just wrote — so treat `full − level 1` as
+    ///   the authority and this arm as its corroboration.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bench_superword_phase_split -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_superword_phase_split() {
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
+        let docs = split_docs(&input, b"<|endoftext|>");
+        let mut tok = load_hf_bpe(&superbpe_artifact()).expect("load SuperBPE artifact");
+        assert!(tok.superword_threshold().is_some(), "no plan: nothing to decompose");
+
+        let mut level1: Vec<Vec<u32>> = Vec::with_capacity(docs.len());
+        for doc in &docs {
+            let mut stream = Vec::new();
+            tok.superword_level1_only(doc, &mut stream);
+            level1.push(stream);
+        }
+        report_level1_lengths(&level1);
+
+        let mut full_out: Vec<u32> = Vec::new();
+        let mut best_full = 0.0f64;
+        for round in 0..rounds {
+            let mut out: Vec<u32> = Vec::new();
+            let start = std::time::Instant::now();
+            for doc in &docs {
+                tok.encode_with_added_tokens_flat(doc, &mut out);
+            }
+            best_full = best_full.max(mbytes / start.elapsed().as_secs_f64());
+            if round == 0 {
+                full_out = out;
+            }
+        }
+
+        let mut best_l1 = 0.0f64;
+        for _ in 0..rounds {
+            let mut sink: Vec<u32> = Vec::new();
+            let start = std::time::Instant::now();
+            for doc in &docs {
+                tok.superword_level1_only(doc, &mut sink);
+            }
+            best_l1 = best_l1.max(mbytes / start.elapsed().as_secs_f64());
+        }
+
+        let mut best_l2 = 0.0f64;
+        for _ in 0..rounds {
+            let mut sink: Vec<u32> = Vec::new();
+            let start = std::time::Instant::now();
+            for stream in &level1 {
+                tok.superword_level2_only(stream, &mut sink);
+            }
+            best_l2 = best_l2.max(mbytes / start.elapsed().as_secs_f64());
+            assert_eq!(sink, full_out, "level-2 replay must reproduce the output");
+        }
+
+        eprintln!("      full: {best_full:8.1} MB/s   ({mbytes:.1} MB, min of {rounds})");
+        eprintln!("   level 1: {best_l1:8.1} MB/s   (fill + cached stage-1 encode)");
+        eprintln!("   level 2: {best_l2:8.1} MB/s   (merge alone, replayed)");
+        // Serial phases compose as reciprocals, so the level-2 share the real
+        // path pays is what is left of `full` once level 1 is subtracted.
+        let derived = 1.0 / (1.0 / best_full - 1.0 / best_l1);
+        eprintln!("  level 2': {derived:8.1} MB/s   (full - level 1; the authority)");
+        eprintln!(
+            "     split: level 1 {:.0}% / level 2 {:.0}% of the two-level cost",
+            100.0 * best_full / best_l1,
+            100.0 * best_full / derived,
+        );
+    }
+
+    /// Interleaved A/B of the round-2 two-level optimizations: buffer-backed vs
+    /// generic-iterator level-1 fill × inert-boundary cuts vs whole-stream
+    /// level-2 merge.
+    ///
+    /// All four arms run on **one** tokenizer, flipping two runtime switches
+    /// between them (`Tokenizer::set_superword_variant`), and are interleaved
+    /// round by round with min-of-N per arm. That is the only honest shape here:
+    /// separate builds differ by more than the effects being measured (this box
+    /// reads ~4% differently on either side of a compile), and a second resident
+    /// tokenizer's 16 MiB dense rank grid evicts the first's working set. Token
+    /// streams are asserted identical across arms every round, so a variant that
+    /// wins by computing something else cannot go unnoticed.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bench_superword_variants -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_superword_variants() {
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
+        let docs = split_docs(&input, b"<|endoftext|>");
+        let mut tok = load_hf_bpe(&superbpe_artifact()).expect("load SuperBPE artifact");
+        assert!(tok.superword_threshold().is_some(), "no plan: nothing to measure");
+        report_cut_stats(&mut tok, &docs);
+
+        // (label, buf_fill, use_cuts) — arm 0 is 1d5d63e's shape.
+        const ARMS: [(&str, bool, bool); 4] = [
+            ("iter + whole", false, false),
+            ("iter + cuts", false, true),
+            ("buf  + whole", true, false),
+            ("buf  + cuts", true, true),
+        ];
+        let mut best = [0.0f64; ARMS.len()];
+        let mut reference: Vec<u32> = Vec::new();
+        for round in 0..rounds {
+            for (i, &(label, buf_fill, use_cuts)) in ARMS.iter().enumerate() {
+                tok.set_superword_variant(buf_fill, use_cuts);
+                let mut out: Vec<u32> = Vec::new();
+                let start = std::time::Instant::now();
+                for doc in &docs {
+                    tok.encode_with_added_tokens_flat(doc, &mut out);
+                }
+                best[i] = best[i].max(mbytes / start.elapsed().as_secs_f64());
+                if round == 0 && i == 0 {
+                    reference = out;
+                } else {
+                    assert_eq!(out, reference, "arm {label:?} produced different tokens");
+                }
+            }
+        }
+        eprintln!(
+            "  slice: {mbytes:.1} MB, {} docs, {} tokens, min of {rounds}",
+            docs.len(),
+            reference.len(),
+        );
+        for (i, &(label, _, _)) in ARMS.iter().enumerate() {
+            let delta = (best[i] / best[0] - 1.0) * 100.0;
+            eprintln!("  {label}: {:8.1} MB/s  ({delta:+.1}%)", best[i]);
+        }
+    }
+
+    /// What the contraction-tail hazard cost: the same encode with the
+    /// threshold the pre-fix glue rules forced (381) against the one the fixed
+    /// rules derive (40000, the artifact's transition point).
+    ///
+    /// A threshold is a load-time property, so unlike the variant switches this
+    /// needs two plans; both arms therefore pay the same
+    /// two-resident-tokenizers penalty, and they are interleaved with
+    /// min-of-N. Capping is an exact stand-in for an unglued hazard, whose
+    /// entire effect is the threshold it forces (`SuperwordPlan::build_capped`).
+    ///
+    /// Run with
+    /// `cargo test --release --lib bench_superword_glue_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_superword_glue_cost() {
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
+        let docs = split_docs(&input, b"<|endoftext|>");
+        let path = superbpe_artifact();
+
+        let mut fixed = load_hf_bpe(&path).expect("load SuperBPE artifact");
+        assert_eq!(fixed.superword_threshold(), Some(40_000));
+        let mut pre_fix = load_hf_bpe(&path).expect("load SuperBPE artifact");
+        pre_fix.cap_superword_threshold(381);
+        assert_eq!(pre_fix.superword_threshold(), Some(381));
+
+        let mut best = [0.0f64; 2];
+        let mut reference: Vec<u32> = Vec::new();
+        for round in 0..rounds {
+            for (i, tok) in [&mut pre_fix, &mut fixed].into_iter().enumerate() {
+                let mut out: Vec<u32> = Vec::new();
+                let start = std::time::Instant::now();
+                for doc in &docs {
+                    tok.encode_with_added_tokens_flat(doc, &mut out);
+                }
+                best[i] = best[i].max(mbytes / start.elapsed().as_secs_f64());
+                if round == 0 && i == 0 {
+                    reference = out;
+                } else {
+                    assert_eq!(out, reference, "capping the threshold changed the tokens");
+                }
+            }
+        }
+        // Level-1 density is the mechanism: a collapsed threshold leaves level 1
+        // applying almost no merges, so its output is near-raw bytes.
+        for (label, tok) in [("threshold 381", &mut pre_fix), ("threshold 40000", &mut fixed)] {
+            let mut stream: Vec<u32> = Vec::new();
+            for doc in &docs {
+                tok.superword_level1_only(doc, &mut stream);
+            }
+            eprintln!(
+                "  {label:>15}: level 1 emits {} symbols ({:.2} bytes/symbol)",
+                stream.len(),
+                mbytes * 1e6 / stream.len() as f64,
+            );
+        }
+        eprintln!("  slice: {mbytes:.1} MB, {} docs, min of {rounds}", docs.len());
+        eprintln!("    pre-fix (threshold  381): {:8.1} MB/s", best[0]);
+        let speedup = best[1] / best[0];
+        eprintln!("      fixed (threshold 40000): {:8.1} MB/s  ({speedup:.2}x)", best[1]);
+    }
+
+    /// How many level-1 boundaries `SuperwordCuts` can cut, and the run-length
+    /// distribution that leaves for level 2 — the mechanism's whole thesis is
+    /// that the runs land under `SMALL_MERGE_MAX`.
+    fn report_cut_stats(tok: &mut Tokenizer, docs: &[&[u8]]) {
+        const EDGES: [usize; 6] = [2, 4, 8, 16, 33, usize::MAX];
+        let mut buckets = [0usize; EDGES.len()];
+        let (mut symbols, mut runs) = (0usize, 0usize);
+        let mut stream: Vec<u32> = Vec::new();
+        for doc in docs {
+            stream.clear();
+            tok.superword_level1_only(doc, &mut stream);
+            symbols += stream.len();
+            for len in tok.superword_run_lengths(&stream) {
+                runs += 1;
+                buckets[EDGES.iter().position(|&e| len < e).unwrap_or(EDGES.len() - 1)] += 1;
+            }
+        }
+        eprintln!(
+            "  level-2 runs: {runs} over {symbols} symbols (mean {:.1}, {:.1}% of boundaries cut)",
+            symbols as f64 / runs.max(1) as f64,
+            100.0 * (runs.saturating_sub(docs.len())) as f64 / symbols.max(1) as f64,
+        );
+        let mut lo = 1;
+        for (b, &count) in buckets.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            match EDGES.get(b) {
+                Some(&hi) if hi != usize::MAX => {
+                    eprintln!("    len {lo:>3}..{:<3} {count}", hi - 1)
+                }
+                _ => eprintln!("    len {lo:>3}..    {count}"),
+            }
+            lo = EDGES.get(b).copied().unwrap_or(usize::MAX);
+        }
+    }
+
+    /// `(corpus slice, its size in MB, round count)` for the superword benches,
+    /// sized by `SUPERBPE_BENCH_MB` / `SUPERBPE_BENCH_ROUNDS`.
+    fn superbpe_bench_corpus() -> (Vec<u8>, f64, usize) {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        }
+        let input = load_owt(env_usize("SUPERBPE_BENCH_MB", 32) << 20);
+        // Document separators are dropped by `split_docs`, so measure the bytes
+        // that actually reach the encoder.
+        let bytes: usize = split_docs(&input, b"<|endoftext|>").iter().map(|d| d.len()).sum();
+        (input, bytes as f64 / 1e6, env_usize("SUPERBPE_BENCH_ROUNDS", 5).max(1))
+    }
+
+    fn superbpe_artifact() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("benchmarks/superbpe/artifacts/ours_superbpe.json")
+    }
+
+    /// Histogram of per-document level-1 stream lengths — the `n` the level-2
+    /// merge runs on, and so what decides whether it takes the heap or the
+    /// small-merge core (`SMALL_MERGE_MAX` = 32).
+    fn report_level1_lengths(level1: &[Vec<u32>]) {
+        const EDGES: [usize; 8] = [2, 8, 32, 128, 512, 2048, 8192, usize::MAX];
+        let mut buckets = [0usize; EDGES.len() + 1];
+        let mut total = 0usize;
+        for stream in level1 {
+            total += stream.len();
+            let b = EDGES.iter().position(|&e| stream.len() < e).unwrap_or(EDGES.len());
+            buckets[b] += 1;
+        }
+        eprintln!(
+            "  level-1 stream lengths ({} docs, {total} symbols, mean {:.0}):",
+            level1.len(),
+            total as f64 / level1.len().max(1) as f64,
+        );
+        let mut lo = 0;
+        for (b, &count) in buckets.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            match EDGES.get(b) {
+                Some(&hi) if hi != usize::MAX => eprintln!("    {lo:>6}..{:<6} {count}", hi - 1),
+                _ => eprintln!("    {lo:>6}..       {count}"),
+            }
+            lo = EDGES.get(b).copied().unwrap_or(usize::MAX);
+        }
     }
 
     /// Cut `input` at the first newline at or after `at` (whole input if none).
