@@ -69,11 +69,19 @@ def prepare_corpus(corpus: str, train_mb: float, work: Path) -> tuple[Path, int]
 
 
 def run_stage(python: str, repo: str, output_dir: Path, *, corpus_dir: Path | None, num_bytes: int | None, vocab_size: int, regex: str) -> float:
-    """Invoke ``python -m train_tokenizer`` for one stage; return wall-clock."""
+    """Invoke ``python -m train_tokenizer`` for one stage; return wall-clock.
+
+    Every path handed to the subprocess must be absolute: it runs with
+    ``cwd=repo`` (the reference imports ``train_tokenizer`` as a module, so it
+    has to), and ``train_tokenizer.py`` then ``os.chdir``es into ``--output_dir``
+    on top of that -- it looks for ``merges.txt`` in the working directory to
+    decide whether it is extending. A relative path survives neither hop.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.resolve()
     cmd = [python, "-m", "train_tokenizer", "--output_dir", str(output_dir), "--vocab_size", str(vocab_size), "--regex_string", regex]
     if corpus_dir is not None:
-        cmd += ["--corpus_dir", str(corpus_dir)]
+        cmd += ["--corpus_dir", str(corpus_dir.resolve())]
     if num_bytes is not None:
         cmd += ["--num_bytes", str(num_bytes)]
     t0 = time.perf_counter()
@@ -136,7 +144,7 @@ def main() -> None:
     if not os.path.exists(os.path.join(repo, "train_tokenizer.py")):
         raise SystemExit(f"{repo} is not a superbpe checkout (no train_tokenizer.py); clone github.com/PythonNut/superbpe")
 
-    outdir = Path(args.outdir)
+    outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     work = outdir / "_work"
     work.mkdir(parents=True, exist_ok=True)

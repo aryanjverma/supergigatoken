@@ -1,0 +1,124 @@
+{
+  "differential": {
+    "merges": {
+      "jaccard": 0.9027,
+      "ours": 49744,
+      "rank_spearman": 0.999,
+      "reference": 49796,
+      "shared": 47226
+    },
+    "shared_token_id_displacement": {
+      "max": 34711,
+      "median": 38,
+      "p90": 492,
+      "within_100": 82.67
+    },
+    "subwords": {
+      "jaccard": 0.9473,
+      "shared": 40370,
+      "shared_pct_of_ours": 96.39
+    },
+    "superwords": {
+      "jaccard": 0.7647,
+      "ours": 8118,
+      "reference": 8894,
+      "shared": 7372,
+      "shared_pct_of_ours": 90.81,
+      "shared_pct_of_reference": 82.89
+    },
+    "vocab": {
+      "jaccard": 0.9136,
+      "ours_only": 2258,
+      "reference_only": 2258,
+      "shared": 47742,
+      "shared_pct_of_ours": 95.48,
+      "shared_pct_of_reference": 95.48
+    }
+  },
+  "examples": {
+    "ours_only_earliest": [
+      ", 201",
+      " in 201",
+      ": \u201c",
+      " edit ]",
+      " [ edit ]",
+      ",\u201d he",
+      ": \"",
+      " in 200",
+      ",\u201d said",
+      ",\" he"
+    ],
+    "ours_only_longest": [
+      "Media playback is unsupported on your device Media caption",
+      "Advertisement Continue reading the main story",
+      "Story continues below advertisement",
+      "Enlarge this image toggle caption",
+      "Read or Share this story: http://",
+      " Continue reading the main story",
+      " on your device Media caption",
+      " contributed to this report.",
+      "DamageResonance: 0.4 => 0.5",
+      "What\u2019s Going To Happen?"
+    ],
+    "reference_only_earliest": [
+      " [ edit",
+      " [ edit ]\n",
+      " July ",
+      " March ",
+      " May ",
+      " June ",
+      " April ",
+      " he said.\n",
+      " October ",
+      " September "
+    ],
+    "reference_only_longest": [
+      "Story continues below advertisement\n",
+      " contributed to this report",
+      "What\u2019s Going To Happen? ",
+      " President Vladimir Putin",
+      " Institute of Technology",
+      "What\u2019s Going To Happen",
+      " reading the main story\n",
+      " international community",
+      "Article Continued Below\n",
+      " difference between the"
+    ],
+    "shared_earliest": [
+      " of the",
+      " in the",
+      ", and",
+      ", the",
+      " to the",
+      ". The",
+      ", but",
+      " on the",
+      " for the",
+      " to be"
+    ]
+  },
+  "sides": {
+    "ours": {
+      "label": "gigatoken train_superbpe",
+      "max_superword_len": 58,
+      "mean_superword_len": 9.65,
+      "mean_token_len": 6.9,
+      "mean_words_per_superword": 2.24,
+      "n_superwords": 8118,
+      "path": "benchmarks/superbpe/artifacts/ours_superbpe_s1_100mb.json",
+      "superword_fraction": 0.1624,
+      "vocab_size": 50000
+    },
+    "reference": {
+      "label": "original SuperBPE",
+      "max_superword_len": 36,
+      "mean_superword_len": 9.99,
+      "mean_token_len": 7.06,
+      "mean_words_per_superword": 2.24,
+      "n_superwords": 8894,
+      "path": "benchmarks/superbpe/reference/artifacts/reference_superbpe.json",
+      "superword_fraction": 0.1779,
+      "vocab_size": 50000
+    }
+  }
+}

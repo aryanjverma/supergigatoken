@@ -24,6 +24,16 @@ GROUP_ORDER = {"ours": 0, "reference": 1, "repos": 2}
 GROUP_LABEL = {"ours": "ours (matched vocab)", "reference": "released SuperBPE", "repos": "gigatoken benchmark set"}
 
 
+def _show(token: str) -> str:
+    """A token as inline code, with control characters escaped.
+
+    Superwords legitimately contain newlines and tabs (the reference learns
+    `" [ edit ]\\n"`), and pasting one raw into a markdown list ends the list
+    item mid-token.
+    """
+    return "`" + token.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "`"
+
+
 def _meta_line(meta: dict) -> str:
     bits = []
     if meta.get("cpu"):
@@ -34,9 +44,16 @@ def _meta_line(meta: dict) -> str:
         bits.append(f"{meta['docs']} docs")
     if meta.get("synthetic"):
         bits.append("**synthetic corpus** (OWT file absent; numbers illustrative)")
+    if meta.get("train_mb") is not None:
+        # Axis 3 numbers are training wall-clock, so the *training* slice is the
+        # scale that matters -- and it need not be the one the committed
+        # artifacts were trained at.
+        bits.append(f"train slice: {meta['train_mb']} MB")
     s = meta.get("settings") or {}
     if s:
         bits.append(f"vocab={s.get('vocab')}, transition={s.get('transition')}")
+        if s.get("pretokenizer"):
+            bits.append(f"stage-1 scheme: `{s['pretokenizer']}`")
     return " · ".join(str(b) for b in bits)
 
 
@@ -118,7 +135,57 @@ def parity_section(data: dict, out: list[str]) -> None:
             ex = rec["superword_examples"]
             break
     if ex:
-        out.append("Example learned superwords: " + ", ".join(f"`{e}`" for e in ex[:8]) + ".\n")
+        out.append("Example learned superwords: " + ", ".join(_show(e) for e in ex[:8]) + ".\n")
+
+
+def vocab_diff_section(data: dict, out: list[str]) -> None:
+    """Axis 3b — do the two trainers learn the same tokens? (`vocab_diff.py`)."""
+    out.append("## Axis 3b — Vocabulary differential vs the original SuperBPE\n")
+    if not data:
+        out.append("_No `results_vocab_diff.json`; run `vocab_diff.py` with both tokenizer.json files._\n")
+        return
+    sides, d = data.get("sides", {}), data.get("differential", {})
+    ours, ref = sides.get("ours", {}), sides.get("reference", {})
+    out.append("Axis 3 compares outcomes; this compares the vocabularies themselves. Membership "
+               "overlap alone would not settle it — BPE output depends on merge *priority*, so the "
+               "rank agreement and displacement columns matter as much as the Jaccard ones.\n")
+    out.append("| | ours | reference |")
+    out.append("|---|---:|---:|")
+    for label, key in [
+        ("Vocab size", "vocab_size"),
+        ("Superwords", "n_superwords"),
+        ("Mean token bytes", "mean_token_len"),
+        ("Mean superword bytes", "mean_superword_len"),
+        ("Longest superword", "max_superword_len"),
+        ("Mean words / superword", "mean_words_per_superword"),
+    ]:
+        out.append(f"| {label} | {ours.get(key, '-')} | {ref.get(key, '-')} |")
+    out.append("")
+    out.append("| Overlap | Shared | Jaccard | % of ours | % of reference |")
+    out.append("|---|---:|---:|---:|---:|")
+    for label, key in [("Whole vocab", "vocab"), ("Subwords", "subwords"), ("Superwords", "superwords")]:
+        s = d.get(key, {})
+        out.append(f"| {label} | {s.get('shared', '-')} | {s.get('jaccard', '-')} | "
+                   f"{s.get('shared_pct_of_ours', '-')} | {s.get('shared_pct_of_reference', '-')} |")
+    m = d.get("merges", {})
+    out.append(f"| Merges | {m.get('shared', '-')} | {m.get('jaccard', '-')} | - | - |")
+    out.append("")
+    disp = d.get("shared_token_id_displacement", {})
+    out.append(f"Merge-order agreement over the {m.get('shared', '-')} merges both sides learned: "
+               f"Spearman **{m.get('rank_spearman', '-')}**. Shared tokens sit "
+               f"{disp.get('median', '-')} ids apart at the median "
+               f"({disp.get('within_100', '-')}% within 100, p90 {disp.get('p90', '-')}), "
+               "so a shared token is usually the *same decision*, not a coincidence.\n")
+    ex = data.get("examples", {})
+    for label, key in [
+        ("Learned by both, earliest", "shared_earliest"),
+        ("Ours only, earliest", "ours_only_earliest"),
+        ("Reference only, earliest", "reference_only_earliest"),
+    ]:
+        vals = ex.get(key) or []
+        if vals:
+            out.append(f"- **{label}:** " + ", ".join(_show(v) for v in vals[:6]))
+    out.append("")
 
 
 def _plot_efficiency(data: dict) -> str | None:
@@ -193,6 +260,7 @@ def main() -> None:
     eff = common.load_json(common.RESULTS_EFFICIENCY)
     thr = common.load_json(common.RESULTS_THROUGHPUT)
     par = common.load_json(common.RESULTS_PARITY)
+    vdiff = common.load_json(os.path.join(common.HERE, "results_vocab_diff.json"))
 
     out: list[str] = []
     out.append("# SuperBPE evaluation (supergigatoken)\n")
@@ -219,10 +287,12 @@ def main() -> None:
             out.append(f"![{title}]({os.path.basename(path)})\n")
 
     parity_section(par, out)
+    vocab_diff_section(vdiff, out)
 
     out.append("---\n")
-    out.append("_Regenerate: `efficiency.py`, `throughput.py`, `parity.py`, then `report.py`. "
-               "The reference side of Axis 3 comes from `reference/run_reference.py` (isolated env)._\n")
+    out.append("_Regenerate: `efficiency.py`, `throughput.py`, `parity.py`, `vocab_diff.py`, then "
+               "`report.py`. The reference side of Axes 3/3b comes from "
+               "`reference/run_reference.py` (isolated env)._\n")
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("\n".join(out))

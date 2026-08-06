@@ -341,13 +341,17 @@ def bytes_per_token(n_bytes: int, n_tokens: int) -> float:
 def load_json(path: str) -> dict:
     if not os.path.exists(path):
         return {}
-    with open(path) as f:
+    # JSON is UTF-8 by spec; without this Python uses the locale encoding, which
+    # on Windows is cp1252 and cannot decode a results file holding any
+    # non-ASCII token (superword examples, for one). Every existing results file
+    # is pure ASCII, so this only ever fixes a crash, never changes a value.
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_json(path: str, data: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
 

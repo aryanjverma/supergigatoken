@@ -15,6 +15,19 @@ regex>=2024.5.15
 tqdm>=4.67.1
 huggingface-hub>=0.20.0
 
+# The reference's utils.py imports both of these at module scope, so
+# `train_tokenizer` will not even start without them.
+pysimdjson
+numpy
+safetensors
+# NOTE: install transformers with --no-deps. It depends on `tokenizers`, and
+# resolving that dependency replaces the fork built above with an upstream wheel
+# of the same version (0.20.1) that cannot resume training -- silently, since
+# nothing else changes. 4.46.3 is pinned because its range is tokenizers
+# >=0.20,<0.21, so the runtime version check passes against the fork.
+#     pip install --no-deps transformers==4.46.3
+transformers==4.46.3
+
 # NOTE: the reference trainer itself (train_tokenizer.py, utils.py) lives in the
 # cloned repo, not on PyPI:
 #     git clone --recurse-submodules https://github.com/PythonNut/superbpe.git

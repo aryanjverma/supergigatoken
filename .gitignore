@@ -250,3 +250,17 @@ __marimo__/
 .DS_Store
 
 *.trace/
+# Axis 3 reference trainer: a third-party checkout (PythonNut/superbpe -- which
+# belongs outside this repo anyway, see reference/README.md), its isolated venv
+# with the forked `tokenizers` build, and everything it trains. What gets
+# committed is the *derived* results_parity.json / results_vocab_diff.json, not
+# the reference tokenizer or its manifest.
+/benchmarks/superbpe/reference/superbpe/
+/benchmarks/superbpe/reference/.venv-superbpe/
+/benchmarks/superbpe/reference/artifacts*/
+/benchmarks/superbpe/reference/work/
+
+# Suffixed baselines from `train_baselines.py --suffix` (the Axis 3 matched-regex
+# run, for one). The unsuffixed artifacts stay committed because Axis 1/2 and
+# the Rust superword tests load them; a suffixed one is a 27-second retrain.
+/benchmarks/superbpe/artifacts/*_s1_*.json

@@ -33,6 +33,14 @@ def main() -> None:
     p.add_argument("--tie-breaking", default="huggingface", choices=["huggingface", "lexicographic"])
     p.add_argument("--outdir", default=os.path.join(common.HERE, "artifacts"))
     p.add_argument("--skip-bpe", action="store_true", help="only train the SuperBPE baseline")
+    # The stage-1 scheme has been selectable since the trainers gained a
+    # `pretokenizer` argument; the default stays "gpt2" so the committed
+    # artifacts and the published numbers keep reproducing. Axis 3 wants
+    # "superbpe_stage1" instead -- the reference trainer's own stage-1 regex --
+    # because a trainer comparison that differs in pretokenization is not
+    # controlled, and `--suffix` keeps that run from overwriting the default one.
+    p.add_argument("--pretokenizer", default="gpt2", help="stage-1 scheme (default: %(default)s)")
+    p.add_argument("--suffix", default="", help="appended to the artifact/manifest filenames")
     args = p.parse_args()
 
     from gigatoken import train_bpe, train_superbpe
@@ -42,6 +50,9 @@ def main() -> None:
     print(f"training on {len(train) / 1e6:.1f} MB ({'synthetic' if synthetic else args.file})")
 
     os.makedirs(args.outdir, exist_ok=True)
+    def named(stem: str) -> str:
+        return os.path.join(args.outdir, f"{stem}{args.suffix}.json")
+
     manifest: dict = {
         "corpus": {
             "file": args.file,
@@ -55,6 +66,7 @@ def main() -> None:
             "transition": args.transition,
             "max_unit_len": args.max_unit_len,
             "tie_breaking": args.tie_breaking,
+            "pretokenizer": args.pretokenizer,
         },
         "cpu": common.cpu_label(),
         "tokenizers": {},
@@ -65,9 +77,10 @@ def main() -> None:
     s_vocab, s_merges = train_superbpe(
         train, args.vocab, args.transition, [],
         tie_breaking=args.tie_breaking, separator=sep, max_unit_len=args.max_unit_len,
+        pretokenizer=args.pretokenizer,
     )
     s_time = time.perf_counter() - t0
-    s_path = os.path.join(args.outdir, "ours_superbpe.json")
+    s_path = named("ours_superbpe")
     common.save_hf_tokenizer(common.to_hf_bpe(s_vocab, s_merges, use_regex=False), s_path)
     stats = common.superword_stats(s_vocab)
     manifest["tokenizers"]["ours_superbpe"] = {
@@ -75,6 +88,7 @@ def main() -> None:
         "vocab_size": len(s_vocab),
         "train_time_s": round(s_time, 3),
         "use_regex": False,
+        "pretokenizer": args.pretokenizer,
         **stats,
     }
     print(f"SuperBPE: {len(s_vocab)} tokens, {stats['n_superwords']} superwords, {s_time:.1f}s -> {s_path}")
@@ -82,9 +96,12 @@ def main() -> None:
     # --- our plain BPE (matched vocab) -----------------------------------
     if not args.skip_bpe:
         t0 = time.perf_counter()
-        b_vocab, b_merges = train_bpe(train, args.vocab, [], tie_breaking=args.tie_breaking, separator=sep)
+        b_vocab, b_merges = train_bpe(
+            train, args.vocab, [], tie_breaking=args.tie_breaking, separator=sep,
+            pretokenizer=args.pretokenizer,
+        )
         b_time = time.perf_counter() - t0
-        b_path = os.path.join(args.outdir, "ours_bpe.json")
+        b_path = named("ours_bpe")
         common.save_hf_tokenizer(common.to_hf_bpe(b_vocab, b_merges, use_regex=True), b_path)
         manifest["tokenizers"]["ours_bpe"] = {
             "path": b_path,
@@ -95,7 +112,7 @@ def main() -> None:
         }
         print(f"BPE:      {len(b_vocab)} tokens, {b_time:.1f}s -> {b_path}")
 
-    manifest_path = os.path.join(args.outdir, "baselines.json")
+    manifest_path = named("baselines")
     common.save_json(manifest_path, manifest)
     print(f"wrote manifest -> {manifest_path}")
 

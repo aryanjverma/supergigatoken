@@ -89,6 +89,9 @@ def main() -> None:
             "corpus": args.file,
             "synthetic": synthetic,
             "eval_mb": round(n_bytes / 1e6, 2),
+            # The training slice both trainers were timed on, which is what the
+            # wall-clock column means.
+            "train_mb": (ours_manifest.get("corpus") or {}).get("train_mb"),
             "cpu": common.cpu_label(),
             "settings": ours_manifest.get("settings", {}),
             "note": "outcome parity (speed + quality), not byte-identical merges",

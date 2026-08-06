@@ -61,16 +61,45 @@ gigatoken fast-encodes a SuperBPE tokenizer via the `Superword` pretokenizer (wh
 
 ## Axis 3 — Trainer parity vs the original SuperBPE
 
-_CPU: Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores) · eval slice: 99.74 MB · vocab=50000, transition=40000_
+_CPU: Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores) · eval slice: 99.74 MB · train slice: 100.0 MB · vocab=50000, transition=40000 · stage-1 scheme: `superbpe_stage1`_
 
 Outcome parity (training speed + tokenizer quality), **not** byte-identical merges — see `reference/README.md`.
 
 | Trainer | Train s | Stage1 s | Stage2 s | Vocab | Superwords | Superword % | Bytes/token |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| gigatoken train_superbpe | 765.083 | - | - | 50000 | 7944 | 15.89 | 5.6659 |
+| gigatoken train_superbpe | 27.044 | - | - | 50000 | 8118 | 16.24 | 5.8498 |
+| reference SuperBPE | 223.44 | 10.334 | 213.106 | 50000 | 8894 | 17.79 | 5.6538 |
 
-Example learned superwords: `Media playback is unsupported on your device Media caption`, `Advertisement Continue reading the main story`, `Story continues below advertisement`, `Read or Share this story: http://`, ` Continue reading the main story`, ` Russell County, Kansas (Plate`, `Media playback is unsupported`, ` on your device Media caption`.
+gigatoken's `train_superbpe` trains in **8.26x** the reference's wall-clock (higher = faster).
+
+Example learned superwords: `Media playback is unsupported on your device Media caption`, `Advertisement Continue reading the main story`, `Story continues below advertisement`, `Read or Share this story: http://`, `Enlarge this image toggle caption`, ` Continue reading the main story`, `Media playback is unsupported`, ` on your device Media caption`.
+
+## Axis 3b — Vocabulary differential vs the original SuperBPE
+
+Axis 3 compares outcomes; this compares the vocabularies themselves. Membership overlap alone would not settle it — BPE output depends on merge *priority*, so the rank agreement and displacement columns matter as much as the Jaccard ones.
+
+| | ours | reference |
+|---|---:|---:|
+| Vocab size | 50000 | 50000 |
+| Superwords | 8118 | 8894 |
+| Mean token bytes | 6.9 | 7.06 |
+| Mean superword bytes | 9.65 | 9.99 |
+| Longest superword | 58 | 36 |
+| Mean words / superword | 2.24 | 2.24 |
+
+| Overlap | Shared | Jaccard | % of ours | % of reference |
+|---|---:|---:|---:|---:|
+| Whole vocab | 47742 | 0.9136 | 95.48 | 95.48 |
+| Subwords | 40370 | 0.9473 | 96.39 | - |
+| Superwords | 7372 | 0.7647 | 90.81 | 82.89 |
+| Merges | 47226 | 0.9027 | - | - |
+
+Merge-order agreement over the 47226 merges both sides learned: Spearman **0.999**. Shared tokens sit 38 ids apart at the median (82.67% within 100, p90 492), so a shared token is usually the *same decision*, not a coincidence.
+
+- **Learned by both, earliest:** ` of the`, ` in the`, `, and`, `, the`, ` to the`, `. The`
+- **Ours only, earliest:** `, 201`, ` in 201`, `: “`, ` edit ]`, ` [ edit ]`, `,” he`
+- **Reference only, earliest:** ` [ edit`, ` [ edit ]\n`, ` July `, ` March `, ` May `, ` June `
 
 ---
 
-_Regenerate: `efficiency.py`, `throughput.py`, `parity.py`, then `report.py`. The reference side of Axis 3 comes from `reference/run_reference.py` (isolated env)._
+_Regenerate: `efficiency.py`, `throughput.py`, `parity.py`, `vocab_diff.py`, then `report.py`. The reference side of Axes 3/3b comes from `reference/run_reference.py` (isolated env)._

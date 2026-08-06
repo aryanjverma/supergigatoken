@@ -1,23 +1,25 @@
 {
   "meta": {
-    "corpus": "C:\\Users\\aryan\\data\\owt_train.txt",
+    "corpus": "~/data/owt_train.txt",
     "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
     "eval_mb": 99.74,
     "note": "outcome parity (speed + quality), not byte-identical merges",
     "settings": {
       "max_unit_len": 128,
+      "pretokenizer": "superbpe_stage1",
       "tie_breaking": "huggingface",
       "transition": 40000,
       "vocab": 50000
     },
-    "synthetic": false
+    "synthetic": false,
+    "train_mb": 100.0
   },
   "sides": {
     "ours": {
-      "bytes_per_token": 5.6659,
+      "bytes_per_token": 5.8498,
       "engine": "gigatoken train_superbpe",
       "measured_vocab": 50000,
-      "n_superwords": 7944,
+      "n_superwords": 8118,
       "stage1_time_s": null,
       "stage2_time_s": null,
       "superword_examples": [
@@ -25,19 +27,46 @@
         "Advertisement Continue reading the main story",
         "Story continues below advertisement",
         "Read or Share this story: http://",
+        "Enlarge this image toggle caption",
         " Continue reading the main story",
-        " Russell County, Kansas (Plate",
         "Media playback is unsupported",
         " on your device Media caption",
         " contributed to this report.",
-        " Thank you for subscribing",
+        "DamageResonance: 0.4 => 0.5",
         "Facebook Twitter Pinterest",
-        " House of Representatives"
+        " Thank you for subscribing"
       ],
-      "superword_fraction": 0.1589,
-      "tokens": 17603858,
-      "train_time_s": 765.083,
+      "superword_fraction": 0.1624,
+      "tokens": 17050313,
+      "train_time_s": 27.044,
+      "vocab_size": 50000
+    },
+    "reference": {
+      "bytes_per_token": 5.6538,
+      "engine": "reference SuperBPE",
+      "measured_vocab": 50000,
+      "n_superwords": 8894,
+      "stage1_time_s": 10.334,
+      "stage2_time_s": 213.106,
+      "superword_examples": [
+        "Story continues below advertisement\n",
+        "Media playback is unsupported",
+        " contributed to this report",
+        "Facebook Twitter Pinterest",
+        " Thank you for subscribing",
+        "What\u2019s Going To Happen? ",
+        " House of Representatives",
+        " hundreds of thousands of",
+        " President Vladimir Putin",
+        " reading the main story\n",
+        "What\u2019s Going To Happen",
+        " international community"
+      ],
+      "superword_fraction": 0.1779,
+      "tokens": 17641529,
+      "train_time_s": 223.44,
       "vocab_size": 50000
     }
-  }
+  },
+  "train_speedup_vs_reference": 8.26
 }
