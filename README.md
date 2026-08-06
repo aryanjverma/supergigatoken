@@ -57,9 +57,13 @@ supergigatoken fast-encodes a SuperBPE tokenizer via a new `Superword` pretokeni
 
 | Tokenizer | supergigatoken | HF tokenizers | speedup |
 |---|---:|---:|---:|
-| supergigatoken (SuperBPE, 50k) | 19.3 MB/s | 2.0 MB/s | **9.6×** |
+| supergigatoken (SuperBPE, 50k) | 127.3 MB/s | 5.6 MB/s | **22.7×** |
 
-Both bars encode the *same* tokenizer; they differ only in which engine does the work. Lifting whitespace pretokenization turns each document into one long pretoken, so SuperBPE encoding is inherently slower than gigatoken's cached GB/s subword path — but it is still ~10× faster than HuggingFace. (For reference, HuggingFace encodes the released 128k SuperBPE at ~2.9 MB/s; supergigatoken can't fast-encode that checkpoint yet because it ships a `Split`-regex pretokenizer the loader doesn't map to `Superword` — see [Known Issues](#known-issues).)
+Both bars encode the *same* tokenizer; they differ only in which engine does the work.
+
+Lifting whitespace pretokenization makes each document one long pretoken, which costs SuperBPE every mechanism gigatoken exists for — the pretoken cache never hits, the SIMD boundary scanners have nothing to find, and the merge heap runs over thousands of byte symbols. Most of that is recoverable, because merge priority is the token ID and stage-2 merges are appended after stage-1's: the merge table splits at a threshold into stage-1 merges that cannot span a stage-1 pretoken boundary and superword merges that can. So encoding runs in **two levels** — split at stage-1 boundaries and encode each unit through the ordinary cached GB/s path with the prefix merges, then run the full table over the resulting token stream, which is ~4.5× shorter than the byte sequence. Level 2 in turn only merges across the boundaries a merge can actually cross, which the merge table alone determines; on this corpus that cuts 51% of them and leaves runs averaging 2 symbols. Output is bit-identical to the one-long-pretoken path, which the differential tests assert over the whole slice.
+
+SuperBPE encoding is still ~15× off the cached subword path (1850 MB/s at the same vocab), so there is more to recover — level 1 and level 2 currently split the remaining cost about evenly. (For reference, HuggingFace encodes the released 128k SuperBPE at ~5.3 MB/s; supergigatoken can't fast-encode that checkpoint yet because it ships a `Split`-regex pretokenizer the loader doesn't map to `Superword` — see [Known Issues](#known-issues).)
 
 ### Train your own
 
@@ -358,7 +362,8 @@ Supergigatoken builds on gigatoken (the fast encoder) and SuperBPE (the two-stag
 
 ### SuperBPE-specific
 * The fast `Superword` encoder currently loads SuperBPE tokenizers exported with a `ByteLevel(use_regex=False)` pretokenizer. The released 128k SuperBPE ships an explicit `Split`-regex pretokenizer that isn't mapped to `Superword` yet, so gigatoken can't fast-encode it (HuggingFace-only for now).
-* SuperBPE encoding lifts whitespace pretokenization, so each document is one long pretoken and the per-word cache doesn't apply — it's ~10× faster than HuggingFace but well below gigatoken's GB/s subword path. SIMD acceleration of the superword scheme is future work.
+* SuperBPE encoding lifts whitespace pretokenization, so each document is one long pretoken. Two-level encoding recovers most of the cached path (~23× faster than HuggingFace) but is still ~15× below gigatoken's GB/s subword path, with the remaining cost split about evenly between the two levels. Level 1 pays for splitting through an iterator rather than the SIMD two-phase fill, which needs the glued stage-1 splitter to become a real pretokenizer scheme; that is the next lever.
+* The level-1 splitter glues the pretokenizer boundaries a sub-threshold merge could otherwise span (whitespace runs, apostrophes, digit runs). A hazard it doesn't cover is safe but slow — it lowers the derived threshold, which moves work from level 1 to level 2. The `superbpe_stage1` scheme is still capped that way by `camelCase` letter-run splits (`" Mc"|"C"`, `" You"|"Tube"`), which will matter for any tokenizer genuinely trained with the original stage-1 regex.
 * Stage-2 training is O(n) in unit length; training large vocabs on hundreds of MB is minutes-scale. Our stage 1 is locked to the GPT-2 regex and stage 2 uses line-bounded units, so results are *outcome*-comparable to the original SuperBPE, not byte-identical merges.
 
 ---

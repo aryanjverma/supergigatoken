@@ -47,15 +47,15 @@ At matched vocab, our SuperBPE reaches **1.26x** the bytes/token of plain BPE �
 
 ## Axis 2 — Encoding throughput (gigatoken vs HF)
 
-_CPU: Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores) · eval slice: 99.74 MB · 19937 docs · vocab=50000, transition=40000 · min of 3 repeats_
+_CPU: Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores) · eval slice: 99.74 MB · 19937 docs · vocab=50000, transition=40000 · min of 5 repeats_
 
 gigatoken fast-encodes a SuperBPE tokenizer via the `Superword` pretokenizer (whitespace lifted). tiktoken is skipped — it cannot represent SuperBPE.
 
 | Tokenizer | gigatoken MB/s | HF MB/s | speedup | gigatoken Mtok/s | HF Mtok/s |
 |---|---:|---:|---:|---:|---:|
-| `alisawuffles/superbpe-tokenizer-128k` | **-** | 2.88 | -x | - | 0.462 |
-| `ours_bpe` | **1005.75** | 1.15 | 874.57x | 223.803 | 0.257 |
-| `ours_superbpe` | **19.34** | 2.02 | 9.57x | 3.413 | 0.357 |
+| `alisawuffles/superbpe-tokenizer-128k` | **-** | 5.34 | -x | - | 0.857 |
+| `ours_bpe` | **1849.95** | 1.25 | 1479.96x | 411.659 | 0.279 |
+| `ours_superbpe` | **127.32** | 5.61 | 22.7x | 22.471 | 0.991 |
 
 ![Encoding throughput](throughput.png)
 

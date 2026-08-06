@@ -1,10 +1,10 @@
 {
   "meta": {
-    "corpus": "C:\\Users\\aryan\\data\\owt_train.txt",
+    "corpus": "~/data/owt_train.txt",
     "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
     "docs": 19937,
     "eval_mb": 99.74,
-    "repeats": 3,
+    "repeats": 5,
     "settings": {
       "max_unit_len": 128,
       "tie_breaking": "huggingface",
@@ -23,9 +23,9 @@
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 2.88,
-          "mtokens_per_s": 0.462,
-          "time_s": 34.61,
+          "mb_per_s": 5.34,
+          "mtokens_per_s": 0.857,
+          "time_s": 18.6742,
           "tokens": 16007082
         }
       },
@@ -36,44 +36,44 @@
         "gigatoken": {
           "bytes": 99740832,
           "engine": "gigatoken",
-          "mb_per_s": 1005.75,
-          "mtokens_per_s": 223.803,
-          "time_s": 0.0992,
+          "mb_per_s": 1849.95,
+          "mtokens_per_s": 411.659,
+          "time_s": 0.0539,
           "tokens": 22194723
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 1.15,
-          "mtokens_per_s": 0.257,
-          "time_s": 86.4999,
+          "mb_per_s": 1.25,
+          "mtokens_per_s": 0.279,
+          "time_s": 79.5901,
           "tokens": 22194723
         }
       },
       "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\ours_bpe.json",
-      "speedup_vs_hf": 874.57
+      "speedup_vs_hf": 1479.96
     },
     "ours_superbpe": {
       "engines": {
         "gigatoken": {
           "bytes": 99740832,
           "engine": "gigatoken",
-          "mb_per_s": 19.34,
-          "mtokens_per_s": 3.413,
-          "time_s": 5.1575,
+          "mb_per_s": 127.32,
+          "mtokens_per_s": 22.471,
+          "time_s": 0.7834,
           "tokens": 17603858
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 2.02,
-          "mtokens_per_s": 0.357,
-          "time_s": 49.3701,
+          "mb_per_s": 5.61,
+          "mtokens_per_s": 0.991,
+          "time_s": 17.7717,
           "tokens": 17603858
         }
       },
       "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\ours_superbpe.json",
-      "speedup_vs_hf": 9.57
+      "speedup_vs_hf": 22.7
     }
   }
 }
