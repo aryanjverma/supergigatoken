@@ -4,7 +4,12 @@
 
 **Native SuperBPE: train it in minutes, encode it fast.**
 
-*A 50k-vocab SuperBPE that packs ~20% more text into every token — trained 8× faster than the reference implementation and encoded 23× faster than HuggingFace.*
+*A 50k-vocab SuperBPE that packs ~20% more text into every token — trained 8× faster than the original implementation and encoded 23× faster than HuggingFace.*
+
+![supergigatoken vs the original SuperBPE](assets/superbpe_vs_original.png)
+
+Same corpus slice, same vocabulary size, same transition point, same stage-1 regex — so the only thing that differs is the implementation.
+[How the comparison was run →](benchmarks/superbpe/REPORT.md)
 
 </div>
 

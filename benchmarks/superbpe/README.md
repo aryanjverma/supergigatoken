@@ -3,15 +3,16 @@
 Reproduces the [SuperBPE](../../README.md#superbpe) numbers in the top-level
 README: it trains a SuperBPE tokenizer with supergigatoken's native
 `train_superbpe`, then evaluates it against the original released SuperBPE and
-gigatoken's benchmark tokenizer set along three axes.
+gigatoken's benchmark tokenizer set along four axes.
 
 | Axis | Script | Output |
 |---|---|---|
 | 1. Encoding efficiency (bytes/token) | `efficiency.py` | `results_efficiency.json` |
 | 2. Encoding throughput (gigatoken vs HF) | `throughput.py` | `results_throughput.json` |
 | 3. Trainer parity vs the original reference | `parity.py` (+ [`reference/`](reference/)) | `results_parity.json` |
+| 3b. Vocabulary differential vs the original | `vocab_diff.py` | `results_vocab_diff.json` |
 | Aggregate report + plots | `report.py` | [`REPORT.md`](REPORT.md), `*.png` |
-| Branded README figure | `plot_readme.py` | `../../assets/superbpe_efficiency.png` |
+| Branded README figures | `plot_readme.py` | `../../assets/superbpe_{vs_original,efficiency,throughput}.png` |
 
 ## Quick start
 
@@ -30,8 +31,9 @@ uv run train_baselines.py --file ~/data/owt_train.txt   # our SuperBPE + matched
 uv run efficiency.py --released                          # bytes/token: ours + released + repo set
 uv run throughput.py --released                          # MB/s: gigatoken vs HF
 uv run parity.py                                          # trainer time + quality (our side)
+uv run vocab_diff.py --ours ... --reference ...            # do the two learn the same tokens?
 uv run report.py                                          # aggregate REPORT.md + plots
-uv run plot_readme.py                                     # branded assets/ figure
+uv run plot_readme.py                                     # branded assets/ figures
 ```
 
 Common flags (see `--help`): `--train-mb` / `--eval-mb` (corpus split, default
