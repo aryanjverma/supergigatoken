@@ -88,7 +88,7 @@ When verification fails, `enable_superword_two_level` installs no plan and the p
 
 ## Benchmarks
 
-- `benchmarks/compare/` — cross-library throughput sweep. `sweep.py` dedups repos by tokenizer digest and runs one fresh process per measurement; `results.py merge` folds JSONL into `benchmarks/results.json` (best interleaved round, judged by gigatoken throughput) and `results.py render` rewrites the `<!-- benchmarks:start -->` block in `README.md`. Never hand-edit that block or `results.json`.
+- `benchmarks/compare/` — cross-library throughput sweep of the *inherited subword* engine. `sweep.py` dedups repos by tokenizer digest and runs one fresh process per measurement; `results.py merge` folds JSONL into `benchmarks/results.json` (best interleaved round, judged by gigatoken throughput) and `results.py render` rewrites the `<!-- benchmarks:start -->` block in `benchmarks/compare/SUBWORD_THROUGHPUT.md`. Never hand-edit that block or `results.json`. It renders to its own document, not the README: the README is about what this fork adds, and it links there instead. Note `render` *appends* the block when the markers are absent, so don't paste the markers into a file you don't want the full matrix in.
 - `benchmarks/superbpe/` — the three-axis SuperBPE suite (efficiency / throughput / trainer parity) writing `results_*.json`, `REPORT.md`, and the README figures. Every script falls back to a synthetic corpus when the OWT file is missing, so it runs offline.
 - `pretokenizer_optimization_log.md` and `profiling/` record the step-by-step perf history; consult them before re-litigating a micro-optimization.
 
