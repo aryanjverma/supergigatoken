@@ -1988,6 +1988,37 @@ mod test_util {
         crate::test_hub::gpt2_tokenizer_json()
     }
 
+    /// A `.tiktoken` rank file for the GPT-2 / r50k_base encoding, written into
+    /// a temp dir from the committed GPT-2 fixture.
+    ///
+    /// The two rank-file tests below used to read
+    /// `~/data/tokenizers/r50k_base.tiktoken` and panicked on a machine without
+    /// that optional download. The fixture carries the identical 50256 ranks
+    /// (see `load_tokenizer::hf::gpt2_mergeable_ranks`), so re-encoding them in
+    /// the rank file's own `base64 index` format keeps both tests running
+    /// everywhere — including the file parsing inside `load_tiktoken`, which a
+    /// `load_hf_bpe` substitution would have dropped.
+    ///
+    /// The `TempDir` comes back with the path: dropping it removes the file, so
+    /// the caller must hold it for as long as it reads.
+    pub(super) fn r50k_rank_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        use base64::prelude::*;
+        let ranks =
+            crate::load_tokenizer::hf::gpt2_mergeable_ranks().expect("GPT-2 mergeable ranks");
+        // ~12 bytes/line: 4-8 base64 chars, a space, up to 5 index digits.
+        let mut text = String::with_capacity(ranks.len() * 12);
+        for (rank, token) in ranks.iter().enumerate() {
+            text.push_str(&BASE64_STANDARD.encode(token));
+            text.push(' ');
+            text.push_str(&rank.to_string());
+            text.push('\n');
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("r50k_base.tiktoken");
+        std::fs::write(&path, text).expect("write r50k_base.tiktoken");
+        (dir, path)
+    }
+
     /// Uncached reference encode of one pretoken: byte remap + plain merge
     /// loop over the merges HashMap (no pair-rank table, no cache, no
     /// short-merge kernels).
@@ -2834,12 +2865,17 @@ mod tests {
         }
     }
 
+    /// `from_ranks` must rebuild the merge table from a rank list alone: this
+    /// parses the rank file's own `base64 index` columns (so the density
+    /// invariant is exercised here too) and prints the first 45 reconstructed
+    /// merges. Driven off the committed GPT-2 fixture re-encoded as a rank file
+    /// — the r50k_base ranks byte for byte — rather than an optional
+    /// `~/data/tokenizers/r50k_base.tiktoken` download.
     #[test]
     fn test_merges_from_vocab() {
         use base64::prelude::*;
         let mut buf = String::new();
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let tiktoken_path = data_dir.join("tokenizers/r50k_base.tiktoken");
+        let (_rank_dir, tiktoken_path) = test_util::r50k_rank_file();
         std::fs::File::open(tiktoken_path)
             .expect("Didn't find file")
             .read_to_string(&mut buf)
@@ -2882,11 +2918,14 @@ mod tests {
         }
     }
 
+    /// End-to-end over the tiktoken rank-file loader: parse the ranks, derive
+    /// the merges and the byte remapping, encode and decode. The rank file is
+    /// synthesized from the committed GPT-2 fixture (identical to r50k_base),
+    /// so this no longer depends on an optional `~/data` download.
     #[test]
     fn basic_tokenization() {
         let text = "This is a test string. Please tokenize it!";
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let tiktoken_path = data_dir.join("tokenizers/r50k_base.tiktoken");
+        let (_rank_dir, tiktoken_path) = test_util::r50k_rank_file();
         let mut tokenizer = load_tiktoken(tiktoken_path, PretokenizerType::GPT2, Vec::new())
             .expect("Failed to load tokenizer");
         let pretokenize_iter = crate::pretokenize::pretokenize_as_iter(text.as_bytes());

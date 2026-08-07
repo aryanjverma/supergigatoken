@@ -901,8 +901,13 @@ mod test {
 
     #[test]
     fn test_pretokenizer_ts() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("TinyStoriesV2-GPT4-train.txt")).unwrap();
+        // TinyStories is an optional local corpus, not a committed fixture:
+        // report its absence and stop rather than failing, so a machine without
+        // the download still reads as "no corpus" and not "pretokenizer broken".
+        let Some(path) = crate::test_data::corpus_or_skip("TinyStoriesV2-GPT4-train.txt") else {
+            return;
+        };
+        let file_bytes = fs::read(&path).expect("read TinyStoriesV2-GPT4-train.txt");
 
         let pretokenized_counts = pretokenize_as_iter(&file_bytes).counts();
         eprintln!("Pretokenized {} unique tokens", pretokenized_counts.len());

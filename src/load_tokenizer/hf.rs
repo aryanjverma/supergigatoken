@@ -739,6 +739,45 @@ fn unicode_to_bytes(s: &str, u2b: &HashMap<char, u8>) -> Vec<u8> {
     }
 }
 
+/// The GPT-2 mergeable ranks: the raw bytes of every `model.vocab` entry that
+/// is not an added token, in ID order.
+///
+/// That list is the content of OpenAI's `r50k_base.tiktoken` — GPT-2 and
+/// r50k_base are the same encoding, and the HF export stores the same 50256
+/// ranks in the same order, only escaped through the ByteLevel unicode table
+/// (rank 0 is `!` on both sides). So the tiktoken rank-file tests can be driven
+/// from the committed GPT-2 fixture (`test_hub::gpt2_tokenizer_json`) instead of
+/// an optional `~/data/tokenizers/r50k_base.tiktoken` download, and run
+/// everywhere rather than skipping.
+///
+/// The added tokens have to come out: a rank file holds mergeable ranks only,
+/// and `Tokenizer::from_ranks` requires every multi-byte entry to decompose into
+/// exactly two lower ranks, which `<|endoftext|>` cannot.
+#[cfg(test)]
+pub(crate) fn gpt2_mergeable_ranks() -> Result<Vec<Vec<u8>>> {
+    let tj = read_tokenizer_json(crate::test_hub::gpt2_tokenizer_json())?;
+    let (_b2u, u2b) = build_byte_unicode_tables();
+    let added: std::collections::HashSet<u32> = tj.added_tokens.iter().map(|t| t.id).collect();
+    let mut ranks: Vec<(u32, Vec<u8>)> = tj
+        .model
+        .vocab
+        .iter()
+        .filter(|(_, id)| !added.contains(id))
+        .map(|(tok_str, &id)| (id, unicode_to_bytes(tok_str, &u2b)))
+        .collect();
+    ranks.sort_unstable_by_key(|&(id, _)| id);
+    // A rank file's id column is its line index, so the surviving IDs must be
+    // dense from 0. Checked rather than assumed: a vocab with a gap would
+    // otherwise silently shift every rank past it.
+    for (i, (id, _)) in ranks.iter().enumerate() {
+        ensure!(
+            *id == i as u32,
+            "GPT-2 rank {id} at position {i}: mergeable ranks must be dense"
+        );
+    }
+    Ok(ranks.into_iter().map(|(_, bytes)| bytes).collect())
+}
+
 /// Load a HuggingFace `tokenizer.json` that uses ByteLevel BPE without
 /// byte_fallback (e.g. GPT-2, RoBERTa).
 ///

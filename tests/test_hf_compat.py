@@ -80,7 +80,11 @@ def test_tokenizer_from_transformers_fast(gpt2_hub_dir):
 
 def test_tokenizer_from_json_with_legacy_string_merges(gpt2_tokenizer_path, gpt2_hf):
     """Older tokenizer.json files store merges as "a b" strings."""
-    with open(gpt2_tokenizer_path) as f:
+    # encoding="utf-8" explicitly: a tokenizer.json is UTF-8 by definition, and
+    # GPT-2's ByteLevel vocab escapes bytes into codepoints that the Windows
+    # default (cp1252) has no mapping for, so `open()` without it fails on the
+    # file's content rather than on anything this test is about.
+    with open(gpt2_tokenizer_path, encoding="utf-8") as f:
         config = json.load(f)
     config["model"]["merges"] = [m if isinstance(m, str) else " ".join(m) for m in config["model"]["merges"]]
     tok = gigatoken.Tokenizer.from_json(json.dumps(config, ensure_ascii=False))

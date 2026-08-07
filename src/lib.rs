@@ -7,6 +7,8 @@ pub(crate) mod bpe_train;
 pub(crate) mod input;
 pub mod pretokenize;
 #[cfg(test)]
+pub(crate) mod test_data;
+#[cfg(test)]
 pub(crate) mod test_hub;
 pub(crate) mod token;
 pub use crate::batch::{WorkerPool, encode_docs_ragged, sp_encode_docs_ragged};
