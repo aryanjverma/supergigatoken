@@ -1,5 +1,5 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
-use crate::bpe::superword::{Level1Units, SuperwordPlan};
+use crate::bpe::superword::{self, Level1Units, SuperwordPlan};
 use crate::bpe::{
     ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, SMALL_MERGE_MAX,
     bpe_merge_symbols_by_rank, bpe_merge_symbols_by_rank_slice, bpe_merge_symbols_ranked,
@@ -8,6 +8,7 @@ use crate::bpe::{
 };
 #[cfg(target_arch = "aarch64")]
 use crate::bpe::bpe_merge_symbols_short_neon;
+use crate::pretokenize::fast::level1::Level1Spans;
 use crate::pretokenize::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PRETOKEN_CHUNK,
@@ -811,9 +812,9 @@ impl Tokenizer {
     /// process can A/B the round-2 optimizations against the shapes they
     /// replaced on one set of tables.
     #[cfg(test)]
-    pub(crate) fn set_superword_variant(&mut self, buf_fill: bool, use_cuts: bool) {
+    pub(crate) fn set_superword_variant(&mut self, l1_fill: superword::L1Fill, use_cuts: bool) {
         if let Some(plan) = self.superword.as_mut() {
-            plan.buf_fill = buf_fill;
+            plan.l1_fill = l1_fill;
             plan.use_cuts = use_cuts;
         }
     }
@@ -1185,20 +1186,13 @@ impl Tokenizer {
         let Some(mut plan) = self.superword.take() else { return };
         for unit in self.pretokenizer_type.pretokenize(segment) {
             plan.symbols.clear();
-            // Two fill shapes, selected once per unit (see `SuperwordPlan`'s
-            // kill switches): the generic iterator fill, and the buffer-backed
-            // `PretokenSpans` impl that measured slower than it.
-            if plan.buf_fill {
-                plan.stage1.memoized_encode_flat(
-                    Level1Units::new(unit.0, plan.stage1_scheme),
-                    &mut plan.symbols,
-                );
-            } else {
-                plan.stage1.memoized_encode_flat(
-                    SpanIter(Level1Units::new(unit.0, plan.stage1_scheme)),
-                    &mut plan.symbols,
-                );
-            }
+            Self::superword_level1(
+                &mut plan.stage1,
+                plan.l1_fill,
+                plan.stage1_scheme,
+                unit.0,
+                &mut plan.symbols,
+            );
             match self.pair_ranks.as_deref() {
                 Some(table) => Self::superword_merge(
                     &mut plan,
@@ -1217,6 +1211,39 @@ impl Tokenizer {
             emit(u32s_as_token_ids(&plan.symbols));
         }
         self.superword = Some(plan);
+    }
+
+    /// Level 1 of [`Self::superword_encode_segment`]: split `unit` into
+    /// level-1 units and append their stage-1 encodings to `out`.
+    ///
+    /// The three fill shapes are a runtime switch (see
+    /// [`superword::L1Fill`]) selected once per unit — the campaign
+    /// protocol wants them switchable inside one process, and a branch per
+    /// stage-2 unit is far off the per-span path.
+    ///
+    /// [`Level1Spans`] covers exactly the schemes
+    /// `SuperwordPlan::build` can pick, but it reports that itself rather
+    /// than being assumed to: an unmapped scheme falls back to the iterator
+    /// walk, which handles every scheme, instead of failing to compile the
+    /// day a candidate is added.
+    fn superword_level1(
+        stage1: &mut Tokenizer,
+        l1_fill: superword::L1Fill,
+        scheme: PretokenizerType,
+        unit: &[u8],
+        out: &mut Vec<u32>,
+    ) {
+        if l1_fill == superword::L1Fill::TwoPhase {
+            if let Some(spans) = Level1Spans::new(unit, scheme) {
+                stage1.memoized_encode_flat(spans, out);
+                return;
+            }
+        }
+        if l1_fill == superword::L1Fill::Buf {
+            stage1.memoized_encode_flat(Level1Units::new(unit, scheme), out);
+            return;
+        }
+        stage1.memoized_encode_flat(SpanIter(Level1Units::new(unit, scheme)), out);
     }
 
     /// Level 2 of [`Self::superword_encode_segment`]: merge `plan.symbols` in
@@ -1281,15 +1308,13 @@ impl Tokenizer {
     pub(crate) fn superword_level1_only(&mut self, segment: &[u8], out: &mut Vec<u32>) {
         let Some(mut plan) = self.superword.take() else { return };
         for unit in self.pretokenizer_type.pretokenize(segment) {
-            if plan.buf_fill {
-                plan.stage1
-                    .memoized_encode_flat(Level1Units::new(unit.0, plan.stage1_scheme), out);
-            } else {
-                plan.stage1.memoized_encode_flat(
-                    SpanIter(Level1Units::new(unit.0, plan.stage1_scheme)),
-                    out,
-                );
-            }
+            Self::superword_level1(
+                &mut plan.stage1,
+                plan.l1_fill,
+                plan.stage1_scheme,
+                unit.0,
+                out,
+            );
         }
         self.superword = Some(plan);
     }
@@ -2004,32 +2029,37 @@ mod tests {
         }
     }
 
-    /// Each of the four two-level variants — buffer-backed vs iterator fill ×
+    /// Each of the six two-level variants — the three level-1 fill shapes ×
     /// inert-boundary cuts vs whole-stream merge — must produce the same tokens.
     ///
     /// The variants are performance switches only, so any divergence localises
-    /// the bug immediately: a fill difference means `Level1Units`' offset walk
-    /// disagrees with its slice walk, a cut difference means `SuperwordCuts`
-    /// cleared a boundary a merge can actually cross.
+    /// the bug immediately: an `Iter`/`Buf` difference means `Level1Units`'
+    /// offset walk disagrees with its slice walk, a `TwoPhase` difference means
+    /// the harvest's glue filter disagrees with the scalar unit walk, and a cut
+    /// difference means `SuperwordCuts` cleared a boundary a merge can actually
+    /// cross.
     #[test]
     fn superword_variants_agree() {
         use crate::load_tokenizer::hf::load_hf_bpe;
+        use crate::bpe::superword::L1Fill;
         let mut tok = load_hf_bpe(repo_file(SUPERBPE_ARTIFACT)).expect("load SuperBPE artifact");
         let long = SUPERWORD_CASES.join(" ").repeat(40);
         for case in SUPERWORD_CASES.iter().copied().chain([long.as_str()]) {
             let mut want: Vec<u32> = Vec::new();
-            tok.set_superword_variant(false, false);
+            tok.set_superword_variant(L1Fill::Iter, false);
             tok.encode_with_added_tokens_flat(case.as_bytes(), &mut want);
-            for (buf_fill, use_cuts) in [(false, true), (true, false), (true, true)] {
-                let mut got: Vec<u32> = Vec::new();
-                tok.set_superword_variant(buf_fill, use_cuts);
-                tok.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
-                assert_eq!(
-                    got,
-                    want,
-                    "buf_fill={buf_fill} use_cuts={use_cuts} diverged on {:?}",
-                    &case[..case.len().min(120)],
-                );
+            for l1_fill in [L1Fill::Iter, L1Fill::Buf, L1Fill::TwoPhase] {
+                for use_cuts in [false, true] {
+                    let mut got: Vec<u32> = Vec::new();
+                    tok.set_superword_variant(l1_fill, use_cuts);
+                    tok.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+                    assert_eq!(
+                        got,
+                        want,
+                        "l1_fill={l1_fill:?} use_cuts={use_cuts} diverged on {:?}",
+                        &case[..case.len().min(120)],
+                    );
+                }
             }
         }
     }
@@ -2487,18 +2517,21 @@ mod verify_heavy {
         assert!(tok.superword_threshold().is_some(), "no plan: nothing to measure");
         report_cut_stats(&mut tok, &docs);
 
-        // (label, buf_fill, use_cuts) — arm 0 is 1d5d63e's shape.
-        const ARMS: [(&str, bool, bool); 4] = [
-            ("iter + whole", false, false),
-            ("iter + cuts", false, true),
-            ("buf  + whole", true, false),
-            ("buf  + cuts", true, true),
+        // (label, l1_fill, use_cuts) — arm 0 is 1d5d63e's shape.
+        use crate::bpe::superword::L1Fill;
+        const ARMS: [(&str, L1Fill, bool); 6] = [
+            ("iter  + whole", L1Fill::Iter, false),
+            ("iter  + cuts", L1Fill::Iter, true),
+            ("buf   + whole", L1Fill::Buf, false),
+            ("buf   + cuts", L1Fill::Buf, true),
+            ("2phase + whole", L1Fill::TwoPhase, false),
+            ("2phase + cuts", L1Fill::TwoPhase, true),
         ];
         let mut best = [0.0f64; ARMS.len()];
         let mut reference: Vec<u32> = Vec::new();
         for round in 0..rounds {
-            for (i, &(label, buf_fill, use_cuts)) in ARMS.iter().enumerate() {
-                tok.set_superword_variant(buf_fill, use_cuts);
+            for (i, &(label, l1_fill, use_cuts)) in ARMS.iter().enumerate() {
+                tok.set_superword_variant(l1_fill, use_cuts);
                 let mut out: Vec<u32> = Vec::new();
                 let start = std::time::Instant::now();
                 for doc in &docs {

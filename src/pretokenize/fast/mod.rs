@@ -7,6 +7,7 @@
 //! classes line up.
 
 pub(crate) mod cl100k_family;
+pub(crate) mod level1;
 pub(crate) mod mask;
 pub(crate) mod o200k_family;
 
@@ -63,7 +64,9 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
 ) -> usize {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if mask::simd_scanner_available() {
-        return state.fill_spans_two_phase::<S>(bytes, batch, prefetch);
+        // `GLUE = false`: plain pretoken boundaries. The gluing
+        // instantiation belongs to SuperBPE level 1 (see `level1`).
+        return state.fill_spans_two_phase::<S, false>(bytes, batch, prefetch);
     }
     crate::pretokenize::fill_spans_keyed_with_buf(
         bytes,
