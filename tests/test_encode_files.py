@@ -268,7 +268,11 @@ def test_single_huge_doc_split_matches_serial(tok, tmp_path):
     text = "".join(DOCS) * 500 + "digits 1234567890123 <|endoftext|>\n\n tail"
     assert len(text) > 4 * 2**20
     path = tmp_path / "huge.txt"
-    path.write_text(text)
+    # Binary, not write_text: the tail's "\n\n" would become "\r\n\r\n" under
+    # Python's text-mode newline translation, so the file would hold different
+    # bytes than the serial side encodes and the ids would differ at the tail
+    # for reasons that have nothing to do with chunking.
+    path.write_bytes(text.encode())
 
     serial = tok.encode(text).tolist()
     from_file = tok.encode_files([path])  # whole file = one document

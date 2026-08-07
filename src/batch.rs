@@ -256,6 +256,36 @@ fn build_doc_chunks<'a>(
     chunks
 }
 
+/// Whether an oversized document may be cut into Fragment chunks for this
+/// tokenizer. The two whitespace-lifted SuperBPE schemes may not; every other
+/// scheme fragments oversized docs.
+///
+/// `safe_split_ranges` cuts on a space between two word characters, which is a
+/// pretoken boundary in every *word-splitting* scheme but sits in the middle of
+/// a piece under both of these: `Superword` yields the segment whole (its
+/// learned merges bridge whitespace, so no interior position is guaranteed to be
+/// a unit boundary), and `SuperwordBounded`'s regex has no word alternative, so
+/// `word word` is one of the gaps between its matches (see
+/// `fast::superword_bounded`).
+///
+/// `ByteLevel(add_prefix_space=true)` looks like a second exception and is
+/// not, which is worth recording because the reasoning is not local to this
+/// function. That flag prepends a space to every *segment*
+/// (`Tokenizer::for_each_piece`, once per added-token-delimited piece, as HF
+/// does), and a Fragment is encoded as if it were a whole document — so a
+/// continuation fragment would seem to gain a space the document never had.
+/// It cannot: `safe_split_ranges` cuts *at* the boundary space, so every
+/// continuation fragment already starts with one, and the prepend is guarded
+/// by `segment[0] != b' '`. Only the document's first fragment can receive a
+/// prefix space, which is exactly where the unsplit document receives it.
+/// `bpe_add_prefix_space_fragments_match_serial` pins that.
+fn can_fragment(proto: &Tokenizer) -> bool {
+    !matches!(
+        proto.pretokenizer_type(),
+        PretokenizerType::Superword | PretokenizerType::SuperwordBounded
+    )
+}
+
 /// Split one oversized document into consecutive Fragment chunks with the
 /// descending sizes of `build_doc_chunks`: `big`-sized fragments over the
 /// first `head_len` bytes, `tail_target`-sized fragments after.
@@ -781,19 +811,14 @@ pub(crate) fn encode_docs_ragged_with(
 ) -> (Vec<u32>, Vec<i64>) {
     let total: usize = docs.iter().map(|d| d.len()).sum();
     let added = proto.added_token_split_blockers();
-    // The Superword schemes lift whitespace splitting, so no interior cut is
-    // provably pretoken-safe; every other scheme fragments oversized docs.
-    // `safe_split_ranges` cuts on a space between two word characters, which
-    // is a pretoken boundary in every *word-splitting* scheme but sits in the
-    // middle of a piece under both of these: `Superword` yields the segment
-    // whole, and `SuperwordBounded`'s regex has no word alternative, so
-    // `word word` is one of the gaps between its matches (see
-    // `fast::superword_bounded`).
-    let can_split = !matches!(
-        proto.pretokenizer_type(),
-        PretokenizerType::Superword | PretokenizerType::SuperwordBounded
+    let chunks = build_doc_chunks(
+        docs,
+        total,
+        chunk_target_bytes(total),
+        &added,
+        lpt,
+        can_fragment(proto),
     );
-    let chunks = build_doc_chunks(docs, total, chunk_target_bytes(total), &added, lpt, can_split);
     encode_chunks_gathered(workers, proto, &chunks, total)
 }
 
@@ -1159,6 +1184,175 @@ mod tests {
             &ids_ref[i..(i + 8).min(ids_ref.len())],
             &ids[i..(i + 8).min(ids.len())],
         );
+    }
+
+    /// The BPE fragment path against a REAL merge table, in-process and
+    /// without any corpus on disk.
+    ///
+    /// `parallel_ragged_matches_serial` above runs on a byte-level vocab
+    /// with an *empty* merge table: every pretoken encodes to its own bytes,
+    /// so concatenating the ids of any two halves of a document reproduces
+    /// the whole-document ids no matter where the cut lands. It pins chunk
+    /// ordering, `continues` row accounting and the gather — never boundary
+    /// safety. Only merges make a cut observable, and the only test that had
+    /// them (`verify_parallel_ragged_matches_serial_owt_gpt2_1g`) is
+    /// `#[ignore]`d behind a 1 GB corpus, so `cargo test` covered the
+    /// invariant vacuously.
+    ///
+    /// GPT-2 is the one model guaranteed present (`test_hub` falls back to
+    /// the committed fixture), extended with a space-carrying added token so
+    /// the `safe_split_ranges` blocker logic is live. The text is
+    /// boundary-hostile — the cut predicate is `alnum SPACE alpha`, so every
+    /// line ends in a shape whose tokens change if the space attaches to the
+    /// wrong side — and the explicit small target attempts a cut every few
+    /// hundred bytes, thousands of times over.
+    #[test]
+    fn bpe_parallel_fragmented_matches_serial() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let mut proto = load_hf_bpe(&crate::test_hub::gpt2_tokenizer_json()).expect("load GPT-2");
+        // A space-carrying added token: the only shape that can straddle a
+        // boundary (every boundary sits on a space), and the one the
+        // `blockers` arm of `safe_split_ranges` exists for. One past the
+        // GPT-2 vocab, as `tests/tokenizers/test_chunked_doc.py` does.
+        proto.add_special_token(b"<|multi word separator|>".to_vec(), crate::token::TokenId(50257));
+        let added = proto.added_token_split_blockers();
+        assert!(
+            added.iter().any(|(t, _)| t.contains(&b' ')),
+            "the space-carrying blocker must survive into the split blockers"
+        );
+
+        // Every line ends `<alnum> <alpha>` at least once, so cut probes
+        // land on real boundaries all through the block; the content around
+        // them is what a mis-placed cut would re-tokenize (words that merge
+        // into multi-token units, digit runs, camelCase, contractions,
+        // punctuation runs, multi-byte UTF-8 with combining marks, and the
+        // added token both mid-line and space-adjacent).
+        let block = concat!(
+            "The quick brown fox jumps over the lazy dog again and again today\n",
+            "counters 1234567890123 and 42 and 007 mixed with words here now\n",
+            "camelCaseIdentifiers snake_case_names and CONSTANT_VALUES inline ok\n",
+            "don't isn't we'll they've I'm it's contractions everywhere around us\n",
+            "punctuation!!! ...ellipsis??? (parens) [brackets] {braces} <angle> end\n",
+            "\u{2014} dashes \u{2013} and \u{a0}nbsp\u{a0} and quotes \u{201c}quoted\u{201d} text follows\n",
+            "\u{4e2d}\u{6587}\u{6587}\u{5b57} mixed \u{3068}\u{65e5}\u{672c}\u{8a9e} and e\u{301}a\u{308}o\u{302} combining marks tail\n",
+            "tabs\there and   runs    of  spaces   before words resume normally x\n",
+            "before <|multi word separator|> after and tight<|multi word separator|>tight done\n",
+            "<|endoftext|> plain special token and trailing words to close it out\n",
+        );
+        let mut big = String::new();
+        while big.len() < (6 << 20) {
+            big.push_str(block);
+        }
+        // A grouped-doc run, the oversized doc that fragments, then small
+        // docs so continuation rows land mid-output (as in the SP test).
+        let docs: Vec<&[u8]> = vec![
+            block.as_bytes(),
+            big.as_bytes(),
+            b"",
+            block.as_bytes(),
+            b"tail doc <|endoftext|>",
+        ];
+        let total: usize = docs.iter().map(|d| d.len()).sum();
+
+        let mut ids_ref: Vec<u32> = Vec::new();
+        let mut lens_ref: Vec<i64> = Vec::new();
+        let mut serial = proto.fork();
+        for doc in &docs {
+            encode_into(&mut serial, doc, &mut ids_ref, &mut lens_ref);
+        }
+        drop(serial);
+
+        // The public parallel path first (default target sizing), then a
+        // small explicit target that forces hundreds of fragments, both LPT
+        // shapes. `build_doc_chunks` with lpt=true floors `tail_target` at
+        // MIN_CHUNK_BYTES, so the small target lands entirely in the
+        // `big`-sized primary split; lpt=false exercises the uniform shape.
+        for lpt in [true, false] {
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_docs_ragged_with(&workers, &proto, &docs, lpt);
+            assert_eq!(lens, lens_ref, "lens mismatch (default target, lpt={lpt})");
+            assert_ids_match(&format!("default target, lpt={lpt}"), &flat, &ids_ref);
+
+            let chunks = build_doc_chunks(&docs, total, 16 << 10, &added, lpt, can_fragment(&proto));
+            let fragments = chunks
+                .iter()
+                .filter(|c| matches!(c, EncodeChunk::Fragment { .. }))
+                .count();
+            assert!(
+                fragments > 100,
+                "expected many fragments (lpt={lpt}), got {fragments}"
+            );
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_chunks_gathered(&workers, &proto, &chunks, total);
+            assert_eq!(lens, lens_ref, "lens mismatch (small target, lpt={lpt})");
+            assert_ids_match(&format!("small target, lpt={lpt}"), &flat, &ids_ref);
+        }
+    }
+
+    /// `ByteLevel(add_prefix_space=true)` (RoBERTa-style exports) must
+    /// survive fragmenting, for a reason that is split across two files.
+    ///
+    /// The prepend is per *segment* — `Tokenizer::for_each_piece` applies it
+    /// once per added-token-delimited run, as HF does — and a Fragment is
+    /// handed to `encode_with_added_tokens_flat` as if it were a whole
+    /// document. So a continuation fragment looks like it must gain a space
+    /// the document never had, the way the SentencePiece path really would
+    /// (which is why `sp_encode_fragment_into` takes `first`, while the BPE
+    /// fragment's `first` only drives row accounting). It does not, because
+    /// `safe_split_ranges` cuts *at* the boundary space: the space opens the
+    /// continuation fragment, and the prepend is guarded by
+    /// `segment[0] != b' '`.
+    ///
+    /// Measured rather than reasoned: the first version of this test asserted
+    /// the opposite and had `can_fragment` refuse to split these models. Its
+    /// "the fragmented ids must actually diverge" guard — the arm that would
+    /// have justified the refusal — failed, which is how the interaction with
+    /// the cut position was found. Without this test the refusal would have
+    /// looked correct and cost these models the whole-document split.
+    #[test]
+    fn bpe_add_prefix_space_fragments_match_serial() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let mut proto = load_hf_bpe(&crate::test_hub::gpt2_tokenizer_json()).expect("load GPT-2");
+        proto.set_add_prefix_space(true);
+        let added = proto.added_token_split_blockers();
+
+        // Plenty of `alnum SPACE alpha` cut points, and an added token so the
+        // multi-segment shape (one prepend per segment) is live.
+        let block = concat!(
+            "The quick brown fox jumps over the lazy dog and keeps on running\n",
+            "words and 12345 numbers and camelCase and don't contractions here\n",
+            "an added token follows <|endoftext|> and more words come after it\n",
+        );
+        let mut big = String::new();
+        while big.len() < (6 << 20) {
+            big.push_str(block);
+        }
+        let docs: Vec<&[u8]> = vec![block.as_bytes(), big.as_bytes(), b"tail words here"];
+        let total: usize = docs.iter().map(|d| d.len()).sum();
+
+        let mut ids_ref: Vec<u32> = Vec::new();
+        let mut lens_ref: Vec<i64> = Vec::new();
+        let mut serial = proto.fork();
+        for doc in &docs {
+            encode_into(&mut serial, doc, &mut ids_ref, &mut lens_ref);
+        }
+        drop(serial);
+
+        for lpt in [true, false] {
+            let chunks = build_doc_chunks(&docs, total, 16 << 10, &added, lpt, can_fragment(&proto));
+            let fragments = chunks
+                .iter()
+                .filter(|c| matches!(c, EncodeChunk::Fragment { .. }))
+                .count();
+            assert!(
+                fragments > 100,
+                "expected many fragments (lpt={lpt}), got {fragments}"
+            );
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_chunks_gathered(&workers, &proto, &chunks, total);
+            assert_eq!(lens, lens_ref, "lens mismatch (lpt={lpt})");
+            assert_ids_match(&format!("add_prefix_space, lpt={lpt}"), &flat, &ids_ref);
+        }
     }
 
     /// SentencePiece parallel chunked encode — grouped documents plus
