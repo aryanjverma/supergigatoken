@@ -167,9 +167,16 @@ pub(crate) fn train_bpe<'py>(
 /// (e.g. Devanagari) and — because stage 2 lifts all splitting — lets
 /// stage 2 repair damage stage 1 caused, inflating the apparent superword
 /// gain for exactly those scripts.
+///
+/// `timings`, if given a dict, receives `"stage1_s"` and `"stage2_s"`
+/// (seconds). The two stages are one Rust call with no Python-visible
+/// boundary between them, so a caller that wants the split -- the Axis 3
+/// trainer comparison, which is against a reference that runs its stages as
+/// two processes -- cannot time them from outside. An out-parameter keeps
+/// the return type unchanged for every existing caller.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
-#[pyo3(signature = (in_data, vocab_size, transition_point, special_tokens, tie_breaking = "huggingface", separator = None, max_unit_len = 128, pretokenizer = "gpt2"))]
+#[pyo3(signature = (in_data, vocab_size, transition_point, special_tokens, tie_breaking = "huggingface", separator = None, max_unit_len = 128, pretokenizer = "gpt2", timings = None))]
 pub(crate) fn train_superbpe<'py>(
     py: Python<'py>,
     in_data: Bound<'py, PyAny>,
@@ -180,6 +187,7 @@ pub(crate) fn train_superbpe<'py>(
     separator: Option<&[u8]>,
     max_unit_len: usize,
     pretokenizer: &str,
+    timings: Option<Bound<'py, PyDict>>,
 ) -> PyResult<(
     Bound<'py, PyDict>,
     Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
@@ -222,10 +230,16 @@ pub(crate) fn train_superbpe<'py>(
     };
 
     // Stage 1: standard whitespace-pretokenized BPE up to the transition point.
+    // Pretokenization is counted with stage 1 because that is the split the
+    // reference trainer's two invocations draw: its stage-1 process scans the
+    // corpus, its stage-2 process resumes from the merges.
+    let t0 = std::time::Instant::now();
     let counts = pretokenize::pretokenize_par_bytes(bytes, separator, scheme);
     let stage1 = bpe_train::train_bpe(counts, transition_point, special_tokens, tie_breaking);
+    let stage1_s = t0.elapsed().as_secs_f64();
 
     // Stage 2: resume with whitespace pretokenization lifted (superwords).
+    let t1 = std::time::Instant::now();
     let result = bpe_train::train_superbpe_stage2(
         bytes,
         separator,
@@ -234,6 +248,12 @@ pub(crate) fn train_superbpe<'py>(
         tie_breaking,
         max_unit_len,
     );
+    let stage2_s = t1.elapsed().as_secs_f64();
+
+    if let Some(timings) = timings {
+        timings.set_item("stage1_s", stage1_s)?;
+        timings.set_item("stage2_s", stage2_s)?;
+    }
 
     bpe_result_to_python(py, result)
 }

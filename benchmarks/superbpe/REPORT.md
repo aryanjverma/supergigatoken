@@ -6,12 +6,12 @@ SuperBPE (Liu et al., 2025) trained natively by supergigatoken's `train_superbpe
 
 _CPU: Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores) · eval slice: 99.74 MB · 19937 docs · vocab=50000, transition=40000_
 
-Higher bytes/token = fewer tokens for the same text = more efficient. The controlled result is **our SuperBPE vs our BPE at identical vocab** (only the whitespace restriction differs); other rows are reference points at their own vocab sizes.
+Higher bytes/token = fewer tokens for the same text = more efficient. The controlled result is **supergigatoken's SuperBPE vs gigatoken's plain BPE at identical vocab** (only the whitespace restriction differs); other rows are reference points at their own vocab sizes.
 
 | Tokenizer | Group | Vocab | Bytes/token | Tokens |
 |---|---|---:|---:|---:|
-| `ours_superbpe` | ours (matched vocab) | 50000 | **5.6659** | 17603858 |
-| `ours_bpe` | ours (matched vocab) | 50000 | **4.4939** | 22194723 |
+| `supergigatoken` | ours (matched vocab) | 50000 | **5.6659** | 17603858 |
+| `gigatoken` | ours (matched vocab) | 50000 | **4.4939** | 22194723 |
 | `alisawuffles/superbpe-tokenizer-128k` | released SuperBPE | 128001 | **6.231** | 16007082 |
 | `microsoft/Phi-4-mini-instruct` | gigatoken benchmark set | 200029 | **4.7016** | 21214061 |
 | `openai/gpt-oss-120b` | gigatoken benchmark set | 200019 | **4.7016** | 21214061 |
@@ -41,7 +41,7 @@ Higher bytes/token = fewer tokens for the same text = more efficient. The contro
 | `codellama/CodeLlama-7b-hf` | gigatoken benchmark set | 32016 | **3.8881** | 25652821 |
 | `microsoft/Phi-3-mini-4k-instruct` | gigatoken benchmark set | 32011 | **3.8881** | 25652822 |
 
-At matched vocab, our SuperBPE reaches **1.26x** the bytes/token of plain BPE — **20.7% fewer tokens** for the same text.
+At matched vocab, supergigatoken reaches **1.26x** the bytes/token of gigatoken's plain BPE — **20.7% fewer tokens** for the same text.
 
 ![Encoding efficiency](efficiency.png)
 
@@ -54,8 +54,8 @@ gigatoken fast-encodes a SuperBPE tokenizer via the `Superword` pretokenizer (wh
 | Tokenizer | gigatoken MB/s | HF MB/s | speedup | gigatoken Mtok/s | HF Mtok/s |
 |---|---:|---:|---:|---:|---:|
 | `alisawuffles/superbpe-tokenizer-128k` | **-** | 5.34 | -x | - | 0.857 |
-| `ours_bpe` | **1849.95** | 1.25 | 1479.96x | 411.659 | 0.279 |
-| `ours_superbpe` | **127.32** | 5.61 | 22.7x | 22.471 | 0.991 |
+| `gigatoken` | **1849.95** | 1.25 | 1479.96x | 411.659 | 0.279 |
+| `supergigatoken` | **127.32** | 5.61 | 22.7x | 22.471 | 0.991 |
 
 ![Encoding throughput](throughput.png)
 
@@ -67,10 +67,10 @@ Outcome parity (training speed + tokenizer quality), **not** byte-identical merg
 
 | Trainer | Train s | Stage1 s | Stage2 s | Vocab | Superwords | Superword % | Bytes/token |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| gigatoken train_superbpe | 27.044 | - | - | 50000 | 8118 | 16.24 | 5.8498 |
+| supergigatoken train_superbpe | 28.069 | 1.977 | 26.078 | 50000 | 8118 | 16.24 | 5.8498 |
 | reference SuperBPE | 223.44 | 10.334 | 213.106 | 50000 | 8894 | 17.79 | 5.6538 |
 
-gigatoken's `train_superbpe` trains in **8.26x** the reference's wall-clock (higher = faster).
+supergigatoken's `train_superbpe` trains in **7.96x** the reference's wall-clock (higher = faster).
 
 Example learned superwords: `Media playback is unsupported on your device Media caption`, `Advertisement Continue reading the main story`, `Story continues below advertisement`, `Read or Share this story: http://`, `Enlarge this image toggle caption`, ` Continue reading the main story`, `Media playback is unsupported`, ` on your device Media caption`.
 

@@ -105,7 +105,7 @@
       "mean_token_len": 6.9,
       "mean_words_per_superword": 2.24,
       "n_superwords": 8118,
-      "path": "benchmarks/superbpe/artifacts/ours_superbpe_s1_100mb.json",
+      "path": "benchmarks/superbpe/artifacts/supergigatoken_s1_100mb.json",
       "superword_fraction": 0.1624,
       "vocab_size": 50000
     },

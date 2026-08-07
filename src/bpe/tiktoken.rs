@@ -1910,7 +1910,7 @@ mod tests {
     /// The committed 50k SuperBPE artifact, trained with `vocab_size = 50000`
     /// and `transition_point = 40000` and no special tokens — so its first
     /// superword token ID is exactly 40000.
-    const SUPERBPE_ARTIFACT: &str = "benchmarks/superbpe/artifacts/ours_superbpe.json";
+    const SUPERBPE_ARTIFACT: &str = "benchmarks/superbpe/artifacts/supergigatoken.json";
 
     /// Corpus for the two-level differential: prose the artifact's superword
     /// merges actually fire on, plus the whitespace shapes whose stage-1
@@ -2104,7 +2104,7 @@ mod tests {
     fn plain_bpe_gets_no_superword_plan() {
         use crate::load_tokenizer::hf::load_hf_bpe;
         for rel in [
-            "benchmarks/superbpe/artifacts/ours_bpe.json",
+            "benchmarks/superbpe/artifacts/gigatoken.json",
             "tests/fixtures/gpt2_tokenizer.json",
         ] {
             let tok = load_hf_bpe(repo_file(rel)).expect("load plain BPE tokenizer");
@@ -2636,7 +2636,7 @@ mod verify_heavy {
 
     fn superbpe_artifact() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("benchmarks/superbpe/artifacts/ours_superbpe.json")
+            .join("benchmarks/superbpe/artifacts/supergigatoken.json")
     }
 
     /// Histogram of per-document level-1 stream lengths — the `n` the level-2

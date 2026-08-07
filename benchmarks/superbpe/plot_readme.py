@@ -16,8 +16,8 @@ what makes it a comparison rather than two unrelated runs.
   standard BPE/SentencePiece tokenizers trace a trend (more vocab -> more
   bytes/token), while SuperBPE tokenizers sit *above* that trend at their vocab
   size (superwords bridge whitespace);
-- right: the controlled matched-vocab bar (~50k) — our SuperBPE vs our plain
-  BPE vs same-size standard tokenizers.
+- right: the controlled matched-vocab bar (~50k) — supergigatoken's SuperBPE vs
+  gigatoken's plain BPE vs same-size standard tokenizers.
 
 ``superbpe_throughput.png`` — encoding MB/s, our engine vs HuggingFace, from
 ``results_throughput.json``.
@@ -84,10 +84,10 @@ def main() -> None:
         v, b, g = r.get("vocab_size"), r.get("bytes_per_token"), r.get("group")
         if not (v and b):
             continue
-        if name == "ours_superbpe":
+        if name == "supergigatoken":
             axL.scatter([v], [b], s=340, marker="*", c=BLUE, edgecolors="white", linewidths=1.1, zorder=6, label="supergigatoken (SuperBPE)")
             _annotate(axL, v, b, f"supergigatoken\n{b:.2f} B/tok @ {v // 1000}k", dx=10, dy=-2, color=BLUE)
-        elif name == "ours_bpe":
+        elif name == "gigatoken":
             axL.scatter([v], [b], s=110, marker="o", c=BLUE, edgecolors="white", linewidths=1.0, zorder=6, label="gigatoken (plain BPE)")
             _annotate(axL, v, b, "gigatoken", dx=8, dy=-14, color=BLUE)
         elif g == "reference":
@@ -110,8 +110,8 @@ def main() -> None:
 
     # ---- Panel B: matched ~50k vocab bar -----------------------------------
     wanted = [
-        ("ours_superbpe", "supergigatoken\n(50k)", BLUE),
-        ("ours_bpe", "gigatoken\n(50k)", "#93c5fd"),
+        ("supergigatoken", "supergigatoken\n(50k)", BLUE),
+        ("gigatoken", "gigatoken\n(50k)", "#93c5fd"),
         ("openai-community/gpt2", "GPT-2\n(50k)", GRAY),
         ("answerdotai/ModernBERT-base", "ModernBERT\n(50k)", GRAY),
     ]
@@ -250,7 +250,17 @@ def _plot_vs_original(plt, out: str) -> None:
     print(f"wrote {out}")
 
 
-_THR_LABELS = {"ours_superbpe": "supergigatoken\n(SuperBPE, 50k)"}
+_THR_LABELS = {"supergigatoken": "supergigatoken\n(SuperBPE, 50k)"}
+
+
+def _is_superbpe(name: str) -> bool:
+    """Is this row a SuperBPE tokenizer (ours or a released one)?
+
+    Substring matching alone no longer decides it: our row is named
+    `supergigatoken`, which does not contain "superbpe", while `gigatoken`
+    (plain BPE) is a substring of it.
+    """
+    return name == "supergigatoken" or "superbpe" in name.lower()
 
 
 def _thr_label(name: str) -> str:
@@ -267,8 +277,8 @@ def _plot_throughput(plt, out: str) -> None:
     toks = thr.get("tokenizers", {})
     # Only SuperBPE tokenizers our engine can actually encode (drops the plain
     # BPE row and any tokenizer gigatoken can't load, so no confusing n/a bars).
-    names = [n for n in toks if "superbpe" in n.lower() and toks[n]["engines"].get("gigatoken", {}).get("mb_per_s")]
-    names.sort(key=lambda n: (0 if n == "ours_superbpe" else 1, n))
+    names = [n for n in toks if _is_superbpe(n) and toks[n]["engines"].get("gigatoken", {}).get("mb_per_s")]
+    names.sort(key=lambda n: (0 if n == "supergigatoken" else 1, n))
     if not names:
         print("no encodable SuperBPE rows in results_throughput.json; skipping throughput figure")
         return

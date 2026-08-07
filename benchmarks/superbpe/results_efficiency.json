@@ -130,6 +130,18 @@
       "tokens": 21618688,
       "vocab_size": 129280
     },
+    "gigatoken": {
+      "bytes": 99740832,
+      "bytes_per_token": 4.4939,
+      "encode_s": 87.521,
+      "engine": "hf",
+      "group": "ours",
+      "n_superwords": 0,
+      "superword_examples": [],
+      "tokens": 22194723,
+      "train_time_s": 7.02,
+      "vocab_size": 50000
+    },
     "google/gemma-4-E4B-it": {
       "bytes": 99740832,
       "bytes_per_token": 4.5089,
@@ -238,19 +250,7 @@
       "tokens": 21214061,
       "vocab_size": 200019
     },
-    "ours_bpe": {
-      "bytes": 99740832,
-      "bytes_per_token": 4.4939,
-      "encode_s": 87.521,
-      "engine": "hf",
-      "group": "ours",
-      "n_superwords": 0,
-      "superword_examples": [],
-      "tokens": 22194723,
-      "train_time_s": 7.02,
-      "vocab_size": 50000
-    },
-    "ours_superbpe": {
+    "supergigatoken": {
       "bytes": 99740832,
       "bytes_per_token": 5.6659,
       "encode_s": 45.081,

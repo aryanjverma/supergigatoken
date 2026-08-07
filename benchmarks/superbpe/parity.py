@@ -81,7 +81,7 @@ def main() -> None:
     print(f"eval slice: {n_bytes / 1e6:.1f} MB, {len(docs)} docs ({'synthetic' if synthetic else args.file})")
 
     ours_manifest = common.load_json(args.manifest)
-    ours_info = ours_manifest.get("tokenizers", {}).get("ours_superbpe", {})
+    ours_info = ours_manifest.get("tokenizers", {}).get("supergigatoken", {})
     ref_info = common.load_json(args.reference)
 
     results: dict = {
@@ -100,10 +100,10 @@ def main() -> None:
     }
 
     if ours_info:
-        results["sides"]["ours"] = _side("gigatoken train_superbpe", ours_info, docs, n_bytes)
+        results["sides"]["ours"] = _side("supergigatoken train_superbpe", ours_info, docs, n_bytes)
         print(f"  ours:      {ours_info.get('train_time_s')}s, {ours_info.get('n_superwords')} superwords")
     else:
-        print("no ours_superbpe in manifest; run train_baselines.py first", file=sys.stderr)
+        print("no supergigatoken in manifest; run train_baselines.py first", file=sys.stderr)
 
     if ref_info:
         results["sides"]["reference"] = _side("reference SuperBPE", ref_info, docs, n_bytes)
@@ -136,7 +136,7 @@ def print_table(results: dict) -> None:
             f"{round(frac * 100, 2) if frac is not None else '-'} | {rec.get('bytes_per_token', '-')} |"
         )
     if "train_speedup_vs_reference" in results:
-        print(f"\ngigatoken train_superbpe is {results['train_speedup_vs_reference']}x the reference's training wall-clock (higher = faster).")
+        print(f"\nsupergigatoken train_superbpe is {results['train_speedup_vs_reference']}x the reference's training wall-clock (higher = faster).")
 
 
 if __name__ == "__main__":

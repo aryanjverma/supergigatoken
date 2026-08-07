@@ -6,7 +6,7 @@ learn the *same tokens*? This script answers it directly, over two
 ``tokenizer.json`` files trained at matched settings.
 
     uv run --no-sync benchmarks/superbpe/vocab_diff.py \
-        --ours benchmarks/superbpe/artifacts/ours_superbpe_stage1.json \
+        --ours benchmarks/superbpe/artifacts/supergigatoken_s1_100mb.json \
         --reference benchmarks/superbpe/reference/artifacts/reference_superbpe.json
 
 What it reports, and why each number is here rather than a single "overlap":

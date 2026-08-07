@@ -19,7 +19,7 @@ Same corpus slice, same vocabulary size, same transition point, same stage-1 reg
 
 Supergigatoken implements SuperBPE natively — both halves, in Rust:
 
-- **`train_superbpe(...)`** — the two-stage trainer. 8.3× faster than the original SuperBPE implementation at matched settings, and it does not run out of memory where that one does.
+- **`train_superbpe(...)`** — the two-stage trainer. 8.0× faster than the original SuperBPE implementation at matched settings, and it does not run out of memory where that one does.
 - **a `Superword` encoder** — two-level encoding that recovers most of a cached tokenizer's speed on a tokenizer whose whitespace pretokenization has been lifted. HuggingFace encodes these slowly; tiktoken cannot represent them at all.
 - **an evaluation suite** under [`benchmarks/superbpe/`](benchmarks/superbpe/) — encoding efficiency, encoding throughput, and a trainer + vocabulary comparison against the original.
 
@@ -69,16 +69,16 @@ Output is bit-identical to feeding the whole document to the byte-level merge lo
 
 There is more to recover: this is still ~15× off gigatoken's subword path (1850 MB/s at the same vocab), with the remaining cost split about evenly between the two levels. For reference, HuggingFace encodes the released 128k SuperBPE checkpoint at ~5.3 MB/s; supergigatoken cannot fast-encode that one yet — see [Known Issues](#known-issues).
 
-### Trainer: 8.3× faster than the original SuperBPE
+### Trainer: 8.0× faster than the original SuperBPE
 
 Both trainers run on the same 100 MB slice at 50k vocab / 40k transition, using the reference's own stage-1 regex on both sides — a trainer comparison that differs in pretokenization is not controlled.
 
-| Trainer | Train time | Superwords | Bytes/token |
-|---|---:|---:|---:|
-| **supergigatoken** (`train_superbpe`) | **27.0 s** | 8118 | **5.85** |
-| original SuperBPE | 223.4 s | 8894 | 5.65 |
+| Trainer | Train time | Stage 1 | Stage 2 | Superwords | Bytes/token |
+|---|---:|---:|---:|---:|---:|
+| **supergigatoken** (`train_superbpe`) | **28.1 s** | **2.0 s** | **26.1 s** | 8118 | **5.85** |
+| original SuperBPE | 223.4 s | 10.3 s | 213.1 s | 8894 | 5.65 |
 
-Faster *and* marginally more efficient. Stage 2 is 213 s of the reference's 223 s — lifting the whitespace restriction is what explodes a trainer's unit set.
+Faster *and* marginally more efficient. Stage 2 dominates both sides — 26.1 s of our 28.1 s, 213.1 s of the reference's 223.4 s — because lifting the whitespace restriction is what explodes a trainer's unit set.
 
 The two learn nearly the same tokenizer: **47742 of 50000 tokens shared** (Jaccard 0.914) and, over the 47226 merges both learned, merge-order **Spearman 0.999**. That last number is the one that matters, because BPE output depends on merge *priority*, not just on which tokens exist — shared tokens sit 38 IDs apart at the median, so they are the same decision rather than a coincidence.
 
