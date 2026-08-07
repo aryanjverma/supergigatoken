@@ -1,0 +1,28 @@
+{
+ "engines": {
+  "gigatoken": {
+   "engine": "gigatoken",
+   "mb_per_s": 35.97,
+   "measured_vocab": 50000,
+   "peak_rss_mb": null,
+   "train_s": 2.78
+  },
+  "hf": {
+   "engine": "hf",
+   "mb_per_s": 9.58,
+   "measured_vocab": 50000,
+   "peak_rss_mb": null,
+   "train_s": 10.438
+  }
+ },
+ "meta": {
+  "corpus": "~/data/owt_train.txt",
+  "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
+  "note": "same corpus/vocab/pretokenizer; HF seeded with the full byte alphabet; one engine per process",
+  "repeats": 3,
+  "synthetic": false,
+  "train_mb": 100.0,
+  "vocab": 50000
+ },
+ "speedup_vs_hf": 3.75
+}

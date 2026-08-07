@@ -4,7 +4,7 @@
     "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
     "docs": 19937,
     "eval_mb": 99.74,
-    "repeats": 5,
+    "repeats": 9,
     "settings": {
       "max_unit_len": 128,
       "tie_breaking": "huggingface",
@@ -23,9 +23,9 @@
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 5.34,
-          "mtokens_per_s": 0.857,
-          "time_s": 18.6742,
+          "mb_per_s": 6.1,
+          "mtokens_per_s": 0.978,
+          "time_s": 16.3616,
           "tokens": 16007082
         }
       },
@@ -36,44 +36,44 @@
         "gigatoken": {
           "bytes": 99740832,
           "engine": "gigatoken",
-          "mb_per_s": 1849.95,
-          "mtokens_per_s": 411.659,
-          "time_s": 0.0539,
+          "mb_per_s": 2290.85,
+          "mtokens_per_s": 509.77,
+          "time_s": 0.0435,
           "tokens": 22194723
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 1.25,
-          "mtokens_per_s": 0.279,
-          "time_s": 79.5901,
+          "mb_per_s": 4.12,
+          "mtokens_per_s": 0.917,
+          "time_s": 24.2075,
           "tokens": 22194723
         }
       },
       "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\gigatoken.json",
-      "speedup_vs_hf": 1479.96
+      "speedup_vs_hf": 556.03
     },
     "supergigatoken": {
       "engines": {
         "gigatoken": {
           "bytes": 99740832,
           "engine": "gigatoken",
-          "mb_per_s": 127.32,
-          "mtokens_per_s": 22.471,
-          "time_s": 0.7834,
+          "mb_per_s": 618.19,
+          "mtokens_per_s": 109.109,
+          "time_s": 0.1613,
           "tokens": 17603858
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 5.61,
-          "mtokens_per_s": 0.991,
-          "time_s": 17.7717,
+          "mb_per_s": 6.76,
+          "mtokens_per_s": 1.192,
+          "time_s": 14.7635,
           "tokens": 17603858
         }
       },
       "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\supergigatoken.json",
-      "speedup_vs_hf": 22.7
+      "speedup_vs_hf": 91.45
     }
   }
 }

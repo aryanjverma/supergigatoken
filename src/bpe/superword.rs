@@ -78,7 +78,13 @@
 //! level 1. Gluing is safe in the direction that matters — it only ever removes
 //! split points, and removing all of them is exactly the plain path — and
 //! because [`derive_threshold`] probes the *glued* splitter, the threshold
-//! always describes the splitting the encode actually performs. A hazard the
+//! always describes the splitting the encode actually performs. That last
+//! clause is load-bearing and no longer self-evident: the probe runs
+//! [`Level1Units`] while the encode runs
+//! [`crate::pretokenize::fast::level1::Level1Fill`], so the two must agree on
+//! every input — including invalid UTF-8, where they would diverge if either
+//! walked the scheme's scalar `advance` instead of the mask scanner. Both go
+//! through the scanner, and `level1_walkers_agree_*` pins it. A hazard the
 //! glue rules do not cover therefore costs speed (a lower threshold, more work
 //! in level 2), never correctness. That is a real cost, though, and a silent
 //! one: `superword_two_level_matches_single_pretoken` asserts the committed
@@ -96,7 +102,7 @@
 //! reach its transition point.
 
 use crate::bpe::tiktoken::Tokenizer;
-use crate::pretokenize::fast::{is_ascii_ws, is_digit};
+use crate::pretokenize::fast::level1::glues;
 use crate::pretokenize::{FastPretokenizerDispatch, Pretoken, PretokenizerType};
 use crate::token::TokenId;
 use rustc_hash::FxBuildHasher;
@@ -116,10 +122,10 @@ const CANDIDATE_SCHEMES: [PretokenizerType; 2] =
 /// depend on more than the immediately adjacent character.
 const VERIFY_PAD: [&[u8]; 8] = [b"", b"x", b" ", b"  ", b"\n", b"1", b"!", b"'"];
 
-/// Level-1 splitting for the two-level encode: the stage-1 scheme's
-/// pretokens, with adjacent pretokens glued across the four junction shapes a
-/// low-ID merge can span (see the module docs for the merge IDs each one
-/// otherwise costs) —
+/// Level-1 splitting for the two-level encode over the *runtime*
+/// pretokenizer enum: the stage-1 scheme's pretokens, with adjacent
+/// pretokens glued across the four junction shapes a low-ID merge can span
+/// (see the module docs for the merge IDs each one otherwise costs) —
 ///
 /// - **whitespace on both sides**, which the `\s+(?!\S)` lookahead can cut
 ///   mid-run: `"a  b"` yields `"a"` and `"  b"` instead of `"a"`, `" "`,
@@ -141,6 +147,12 @@ const VERIFY_PAD: [&[u8]; 8] = [b"", b"x", b" ", b"  ", b"\n", b"1", b"!", b"'"]
 /// No rule is load-bearing on its own: [`derive_threshold`] probes *this*
 /// splitter, so a hazard the rules miss lowers the threshold instead of
 /// changing anyone's tokens.
+///
+/// The encode path does not run this walker — it runs
+/// [`crate::pretokenize::fast::level1::Level1Fill`], which produces the same
+/// units a chunk at a time on the SIMD two-phase fill. This one stays
+/// because `derive_threshold`'s scheme is a runtime value, and it is the
+/// differential reference the chunked fill is checked against.
 pub(crate) struct Level1Units<'a> {
     bytes: &'a [u8],
     inner: FastPretokenizerDispatch<'a>,
@@ -234,55 +246,6 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for Level1Units<'a> {
             prefetch,
         )
     }
-}
-
-/// Whether `next` glues onto the pretoken `prev` that precedes it — the four
-/// junction shapes a sub-threshold merge can span (see [`Level1Units`]).
-#[inline(always)]
-fn glues(prev: &[u8], next: &[u8]) -> bool {
-    (ends_with_whitespace(prev) && starts_with_whitespace(next))
-        || prev.last() == Some(&b'\'')
-        || prev.first() == Some(&b'\'')
-        || next.first().is_some_and(|&b| is_digit(b))
-}
-
-/// Decode the last character of `s` and report whether it is whitespace.
-///
-/// `s` is a pretoken, so it is non-empty, but it need not be valid UTF-8
-/// (the pretokenizers pass malformed bytes through). An undecodable tail
-/// counts as whitespace, which only makes [`Level1Units`] glue more — the
-/// safe direction.
-///
-/// `char::is_whitespace` agrees with [`is_ascii_ws`] on every byte below 0x80,
-/// so an ASCII tail — nearly every pretoken — skips the decode entirely.
-/// `boundary_whitespace_matches_decode` pins the equivalence.
-fn ends_with_whitespace(s: &[u8]) -> bool {
-    match s.last() {
-        Some(&b) if b < 0x80 => return is_ascii_ws(b),
-        None => return true,
-        Some(_) => {}
-    }
-    for k in 1..=4.min(s.len()) {
-        if let Ok(tail) = std::str::from_utf8(&s[s.len() - k..]) {
-            return tail.chars().next_back().is_some_and(char::is_whitespace);
-        }
-    }
-    true
-}
-
-/// [`ends_with_whitespace`] for the first character of `s`.
-fn starts_with_whitespace(s: &[u8]) -> bool {
-    match s.first() {
-        Some(&b) if b < 0x80 => return is_ascii_ws(b),
-        None => return true,
-        Some(_) => {}
-    }
-    for k in 1..=4.min(s.len()) {
-        if let Ok(head) = std::str::from_utf8(&s[..k]) {
-            return head.chars().next().is_some_and(char::is_whitespace);
-        }
-    }
-    true
 }
 
 /// The last character of `a` and the first of `b`, or `None` when the
@@ -566,23 +529,48 @@ pub(crate) struct SuperwordPlan {
     /// both round-2 candidates stay switchable at run time. The branches sit
     /// per segment and per document, never per span or per symbol.
     ///
-    /// Defaults come from `GIGATOK_SUPERWORD_BUFFILL` /
+    /// Defaults come from `GIGATOK_SUPERWORD_L1FILL` /
     /// `GIGATOK_SUPERWORD_NO_CUTS`; `bench_superword_variants` flips them
     /// directly.
-    ///
-    /// `buf_fill` defaults **off**: routing level 1 through
-    /// [`crate::pretokenize::fill_spans_keyed_with_buf`] instead of the generic
-    /// [`crate::pretokenize::SpanIter`] fill was the obvious win on paper — it
-    /// removes the per-span page-boundary branch, the fallible key pack and the
-    /// per-span hash-arm dispatch — and measured **−1.6% alone and −5.7%
-    /// alongside the cuts** on this box (interleaved min-of-5, 33.5 MB OWT).
-    /// The buffer-backed helper reaches its CRC arm through a
-    /// `#[target_feature(enable = "sse4.2")]` boundary, which turns the glue
-    /// walker the closure calls into a real call per span; the same boundary
-    /// cost sank the AVX-512 short-merge scan (`profiling/x86_port_plan.md` §6).
-    /// The impl is kept as the measured A/B arm, not enabled.
-    pub(crate) buf_fill: bool,
+    pub(crate) l1_fill: L1Fill,
     pub(crate) use_cuts: bool,
+}
+
+/// How level 1 pulls its units — the three shapes
+/// `bench_superword_variants` compares (see [`SuperwordPlan::l1_fill`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum L1Fill {
+    /// [`Level1Units`] through the generic [`crate::pretokenize::SpanIter`]
+    /// fill: an `Iterator::next` per unit on top of the enum-dispatched
+    /// `Iterator::next` per stage-1 pretoken.
+    Iter,
+    /// [`Level1Units`] through
+    /// [`crate::pretokenize::fill_spans_keyed_with_buf`]. Removing the
+    /// per-span page-boundary branch, the fallible key pack and the per-span
+    /// hash-arm dispatch was the obvious win on paper and measured **−1.6%
+    /// alone and −5.7% alongside the cuts** (interleaved min-of-5, 33.5 MB
+    /// OWT): the buffer-backed helper reaches its CRC arm through a
+    /// `#[target_feature(enable = "sse4.2")]` boundary, which turns the glue
+    /// walker the closure calls into a real call per span — the same
+    /// boundary cost that sank the AVX-512 short-merge scan
+    /// (`profiling/x86_port_plan.md` §6). Kept as the measured A/B arm.
+    Buf,
+    /// [`crate::pretokenize::fast::level1::Level1Spans`]: the mask scanners'
+    /// SIMD two-phase fill with the glue rules applied to the harvested
+    /// boundary buffer. No iterator and no enum dispatch on the per-pretoken
+    /// path, and the same branch-free emission loop the subword path uses —
+    /// which is also why it does not pay `Buf`'s cross-`target_feature`
+    /// call: the filter is a plain function the fill inlines, not a closure
+    /// handed across the boundary.
+    ///
+    /// The default, and the fastest arm on this box: **+14.3% over `Iter`
+    /// alongside the cuts** (156.3 vs 136.7 MB/s, the shipped pairing) and
+    /// **+9.7% without them** (129.8 vs 118.3), interleaved min-of-5 over
+    /// 33.5 MB of OWT. It pays for that with one extra refill pass per fill
+    /// and a one-unit scalar fallback per chunk, both from the deferred last
+    /// boundary — priced in, since gluing is why a harvest of `needed`
+    /// pretoken boundaries yields fewer than `needed` units.
+    TwoPhase,
 }
 
 impl SuperwordPlan {
@@ -645,7 +633,7 @@ impl SuperwordPlan {
             threshold,
             cuts: Arc::new(SuperwordCuts::build(vocab, vocab_inv, merges, threshold)),
             symbols: Vec::new(),
-            buf_fill: env_flag("GIGATOK_SUPERWORD_BUFFILL"),
+            l1_fill: env_l1_fill(),
             use_cuts: !env_flag("GIGATOK_SUPERWORD_NO_CUTS"),
         })
     }
@@ -659,7 +647,7 @@ impl SuperwordPlan {
             threshold: self.threshold,
             cuts: Arc::clone(&self.cuts),
             symbols: Vec::new(),
-            buf_fill: self.buf_fill,
+            l1_fill: self.l1_fill,
             use_cuts: self.use_cuts,
         }
     }
@@ -670,15 +658,25 @@ fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| v != "0")
 }
 
+/// `GIGATOK_SUPERWORD_L1FILL`: `iter`, `buf`, or `twophase` (the default,
+/// and anything unrecognised).
+fn env_l1_fill() -> L1Fill {
+    match std::env::var_os("GIGATOK_SUPERWORD_L1FILL") {
+        Some(v) if v.eq_ignore_ascii_case("iter") => L1Fill::Iter,
+        Some(v) if v.eq_ignore_ascii_case("buf") => L1Fill::Buf,
+        _ => L1Fill::TwoPhase,
+    }
+}
+
 /// Test hooks for `boundary_whitespace_matches_decode`, which compares the
 /// ASCII fast lanes against the decode they short-circuit.
 #[cfg(test)]
 pub(crate) fn ends_with_whitespace_for_test(s: &[u8]) -> bool {
-    ends_with_whitespace(s)
+    crate::pretokenize::fast::level1::ends_with_whitespace(s)
 }
 
 #[cfg(test)]
 pub(crate) fn starts_with_whitespace_for_test(s: &[u8]) -> bool {
-    starts_with_whitespace(s)
+    crate::pretokenize::fast::level1::starts_with_whitespace(s)
 }
 

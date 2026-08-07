@@ -1041,10 +1041,17 @@ impl MaskState {
     /// `scan`) cannot skip the discarded bits. All other fields are reset
     /// so iterator and chunked pulls compose in any order.
     ///
+    /// With `GLUE`, the harvest is filtered through
+    /// [`level1::glue_filter`](super::level1::glue_filter) before phase B,
+    /// which turns the boundary set into SuperBPE level-1 units — the same
+    /// masks and trust rules, minus the junctions the level-1 rules glue
+    /// over. `GLUE = false` (every mask-scanner pretokenizer) const-folds
+    /// the filter and the fallback below away entirely.
+    ///
     /// Callers must ensure [`simd_scanner_available`] (the scheme's
     /// `batch_masks` is unsafe to call otherwise on x86_64).
     #[inline(always)]
-    pub(crate) fn fill_spans_two_phase<'a, S: MaskScheme>(
+    pub(crate) fn fill_spans_two_phase<'a, S: MaskScheme, const GLUE: bool>(
         &mut self,
         bytes: &'a [u8],
         batch: &mut crate::pretokenize::SpanBatch<'a>,
@@ -1071,25 +1078,25 @@ impl MaskState {
                 // scanner tier plus VBMI2; every such CPU has SSE4.2
                 // (also implied by `crc_hash_selected` above).
                 return unsafe {
-                    self.fill_spans_two_phase_avx512_vbmi2_crc::<S>(bytes, batch, prefetch)
+                    self.fill_spans_two_phase_avx512_vbmi2_crc::<S, GLUE>(bytes, batch, prefetch)
                 };
             }
             if avx512_scanner_available() {
                 // SAFETY: AVX-512 tier + SSE4.2 detected right above.
                 return unsafe {
-                    self.fill_spans_two_phase_avx512_crc::<S>(bytes, batch, prefetch)
+                    self.fill_spans_two_phase_avx512_crc::<S, GLUE>(bytes, batch, prefetch)
                 };
             }
             if avx2_scanner_available() {
                 // SAFETY: AVX2 tier + SSE4.2 detected right above.
                 return unsafe {
-                    self.fill_spans_two_phase_avx2_crc::<S>(bytes, batch, prefetch)
+                    self.fill_spans_two_phase_avx2_crc::<S, GLUE>(bytes, batch, prefetch)
                 };
             }
             // SAFETY: `crc_hash_selected` verified SSE4.2 support.
-            return unsafe { self.fill_spans_two_phase_crc::<S>(bytes, batch, prefetch) };
+            return unsafe { self.fill_spans_two_phase_crc::<S, GLUE>(bytes, batch, prefetch) };
         }
-        self.fill_spans_two_phase_impl::<S, false, X86_TIER_DYN>(bytes, batch, prefetch)
+        self.fill_spans_two_phase_impl::<S, false, X86_TIER_DYN, GLUE>(bytes, batch, prefetch)
     }
 
     /// The AVX-512 + VBMI2 tier, CRC-hash monomorphization of
@@ -1108,13 +1115,15 @@ impl MaskState {
     #[target_feature(
         enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,lzcnt,popcnt,sse4.2"
     )]
-    unsafe fn fill_spans_two_phase_avx512_vbmi2_crc<'a, S: MaskScheme>(
+    unsafe fn fill_spans_two_phase_avx512_vbmi2_crc<'a, S: MaskScheme, const GLUE: bool>(
         &mut self,
         bytes: &'a [u8],
         batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
-        self.fill_spans_two_phase_impl::<S, true, X86_TIER_AVX512_VBMI2>(bytes, batch, prefetch)
+        self.fill_spans_two_phase_impl::<S, true, X86_TIER_AVX512_VBMI2, GLUE>(
+            bytes, batch, prefetch,
+        )
     }
 
     /// The AVX-512-tier, CRC-hash monomorphization of
@@ -1129,13 +1138,13 @@ impl MaskState {
     /// ([`avx512_scanner_available`]) and SSE4.2 (`crc_hash_selected`).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt,sse4.2")]
-    unsafe fn fill_spans_two_phase_avx512_crc<'a, S: MaskScheme>(
+    unsafe fn fill_spans_two_phase_avx512_crc<'a, S: MaskScheme, const GLUE: bool>(
         &mut self,
         bytes: &'a [u8],
         batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
-        self.fill_spans_two_phase_impl::<S, true, X86_TIER_AVX512>(bytes, batch, prefetch)
+        self.fill_spans_two_phase_impl::<S, true, X86_TIER_AVX512, GLUE>(bytes, batch, prefetch)
     }
 
     /// The AVX2-tier, CRC-hash monomorphization of
@@ -1148,13 +1157,13 @@ impl MaskState {
     /// ([`avx2_scanner_available`]) and SSE4.2 (`crc_hash_selected`).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,sse4.2")]
-    unsafe fn fill_spans_two_phase_avx2_crc<'a, S: MaskScheme>(
+    unsafe fn fill_spans_two_phase_avx2_crc<'a, S: MaskScheme, const GLUE: bool>(
         &mut self,
         bytes: &'a [u8],
         batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
-        self.fill_spans_two_phase_impl::<S, true, X86_TIER_AVX2>(bytes, batch, prefetch)
+        self.fill_spans_two_phase_impl::<S, true, X86_TIER_AVX2, GLUE>(bytes, batch, prefetch)
     }
 
     /// The SSE4.2-only (CRC-hash, per-batch tier dispatch)
@@ -1170,13 +1179,13 @@ impl MaskState {
     /// ([`simd_scanner_available`]).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse4.2")]
-    unsafe fn fill_spans_two_phase_crc<'a, S: MaskScheme>(
+    unsafe fn fill_spans_two_phase_crc<'a, S: MaskScheme, const GLUE: bool>(
         &mut self,
         bytes: &'a [u8],
         batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
-        self.fill_spans_two_phase_impl::<S, true, X86_TIER_DYN>(bytes, batch, prefetch)
+        self.fill_spans_two_phase_impl::<S, true, X86_TIER_DYN, GLUE>(bytes, batch, prefetch)
     }
 
     /// [`Self::fill_spans_two_phase`]'s body, monomorphized on the hash
@@ -1186,7 +1195,13 @@ impl MaskState {
     /// matching `#[target_feature]` wrappers above, whose feature sets
     /// cover every intrinsic their tier's arms use).
     #[inline(always)]
-    fn fill_spans_two_phase_impl<'a, S: MaskScheme, const X86_CRC: bool, const X86_TIER: u8>(
+    fn fill_spans_two_phase_impl<
+        'a,
+        S: MaskScheme,
+        const X86_CRC: bool,
+        const X86_TIER: u8,
+        const GLUE: bool,
+    >(
         &mut self,
         bytes: &'a [u8],
         batch: &mut crate::pretokenize::SpanBatch<'a>,
@@ -1201,8 +1216,9 @@ impl MaskState {
         let mut scan = self.scan;
         // Rewind onto the grid batch containing `pending` after iterator
         // pops (next_span keeps consumed batches' bits in `rem`, which
-        // this path recomputes). The forward direction is normalized at
-        // each refill below.
+        // this path recomputes). Subsumed by the refill loop's own
+        // normalization below, which now runs in both directions; kept so
+        // the invariant holds for a call that never enters the loop.
         if scan > pending {
             scan -= 64 * (scan - pending).div_ceil(64);
         }
@@ -1219,6 +1235,16 @@ impl MaskState {
             // back); keeps `resume - base <= 63` for every batch below.
             if pending >= scan + 64 {
                 scan += 64 * ((pending - scan) / 64);
+            } else if GLUE && scan > pending {
+                // Gluing also leaves `scan` *ahead*: the filter discards
+                // the harvest's trailing boundaries on nearly every pass,
+                // so `pending` lands behind the batches phase A consumed
+                // and re-entering there would skip the bytes in between.
+                // Without `GLUE` a discard only happens once the chunk is
+                // full, which ends the loop before that can bite — and the
+                // subword path depends on not rewinding here, so the arm
+                // stays const-folded out of it.
+                scan -= 64 * (scan - pending).div_ceil(64);
             }
             let fill_base = pending;
             let needed = PRETOKEN_CHUNK - n;
@@ -1358,11 +1384,40 @@ impl MaskState {
                 }
             }
 
+            // Level-1 gluing: drop the harvested boundaries the unit rules
+            // glue over, leaving unit ends for phase B (see `level1`). The
+            // last boundary is deferred unless it ends the input, so an
+            // exhausted harvest always keeps one — but any other harvest
+            // can come back empty, which the `nb == 0` arm below absorbs.
+            if GLUE {
+                // SAFETY: phase A wrote `nb` ascending pretoken ends
+                // relative to `fill_base`, all within `bytes`.
+                nb = unsafe { super::level1::glue_filter(bytes, fill_base, bufp, nb) };
+                debug_assert!(!exhausted || nb > 0);
+            }
+
             if nb == 0 {
-                // No boundary inside the u16 window: a > 65 KB pretoken.
-                // Emit it alone through the careful pack.
+                // Nothing to emit from the harvest, so this iteration has
+                // to produce a span directly or the refill loop stalls:
+                // either no boundary fit inside the u16 window (a > 65 KB
+                // pretoken), or — under GLUE — the harvest's boundaries all
+                // glued away, which is what a one-boundary harvest and a
+                // long digit run both look like. Returning short instead is
+                // not an option: `PretokenSpans` reads a short fill as end
+                // of input, and `memoized_encode_flat` stops on it.
                 debug_assert!(!exhausted);
-                let end = overflow_end.unwrap_or_else(|| S::advance(bytes, fill_base));
+                let end = if GLUE {
+                    // Not `overflow_end`: that is one pretoken end, and the
+                    // unit it sits in may reach further. Walking from the
+                    // start also keeps this on `next_span` boundaries,
+                    // which `advance` alone does not reproduce on invalid
+                    // UTF-8 (see `level1`).
+                    super::level1::Level1Walk::<S>::new(fill_base)
+                        .next_unit(bytes)
+                        .map_or(len, |(_, end)| end)
+                } else {
+                    overflow_end.unwrap_or_else(|| S::advance(bytes, fill_base))
+                };
                 let span = &bytes[fill_base..end];
                 let (key, h) = match pack_pretoken_key(span) {
                     Some(key) => (key, fill_span_hash::<X86_CRC>(key)),
