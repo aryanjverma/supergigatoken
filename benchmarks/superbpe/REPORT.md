@@ -53,9 +53,9 @@ gigatoken fast-encodes a SuperBPE tokenizer via the `Superword` pretokenizer (wh
 
 | Tokenizer | gigatoken MB/s | HF MB/s | speedup | gigatoken Mtok/s | HF Mtok/s |
 |---|---:|---:|---:|---:|---:|
-| `alisawuffles/superbpe-tokenizer-128k` | **-** | 5.34 | -x | - | 0.857 |
-| `gigatoken` | **1849.95** | 1.25 | 1479.96x | 411.659 | 0.279 |
-| `supergigatoken` | **127.32** | 5.61 | 22.7x | 22.471 | 0.991 |
+| `alisawuffles/superbpe-tokenizer-128k` | **-** | 6.24 | -x | - | 1.002 |
+| `gigatoken` | **1907.91** | 4.52 | 422.1x | 424.556 | 1.005 |
+| `supergigatoken` | **622.07** | 6.71 | 92.71x | 109.793 | 1.184 |
 
 ![Encoding throughput](throughput.png)
 
