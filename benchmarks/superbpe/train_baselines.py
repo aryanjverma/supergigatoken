@@ -73,25 +73,32 @@ def main() -> None:
     }
 
     # --- our SuperBPE -----------------------------------------------------
+    # The two stages run inside one Rust call, so the split comes back through
+    # the `timings` out-dict rather than a second perf_counter here; Axis 3
+    # compares it against a reference that runs its stages as two processes.
+    s_timings: dict[str, float] = {}
     t0 = time.perf_counter()
     s_vocab, s_merges = train_superbpe(
         train, args.vocab, args.transition, [],
         tie_breaking=args.tie_breaking, separator=sep, max_unit_len=args.max_unit_len,
-        pretokenizer=args.pretokenizer,
+        pretokenizer=args.pretokenizer, timings=s_timings,
     )
     s_time = time.perf_counter() - t0
-    s_path = named("ours_superbpe")
+    s_path = named("supergigatoken")
     common.save_hf_tokenizer(common.to_hf_bpe(s_vocab, s_merges, use_regex=False), s_path)
     stats = common.superword_stats(s_vocab)
-    manifest["tokenizers"]["ours_superbpe"] = {
+    manifest["tokenizers"]["supergigatoken"] = {
         "path": s_path,
         "vocab_size": len(s_vocab),
         "train_time_s": round(s_time, 3),
+        "stage1_time_s": round(s_timings["stage1_s"], 3) if "stage1_s" in s_timings else None,
+        "stage2_time_s": round(s_timings["stage2_s"], 3) if "stage2_s" in s_timings else None,
         "use_regex": False,
         "pretokenizer": args.pretokenizer,
         **stats,
     }
-    print(f"SuperBPE: {len(s_vocab)} tokens, {stats['n_superwords']} superwords, {s_time:.1f}s -> {s_path}")
+    print(f"SuperBPE: {len(s_vocab)} tokens, {stats['n_superwords']} superwords, {s_time:.1f}s "
+          f"(stage 1 {s_timings.get('stage1_s', float('nan')):.1f}s, stage 2 {s_timings.get('stage2_s', float('nan')):.1f}s) -> {s_path}")
 
     # --- our plain BPE (matched vocab) -----------------------------------
     if not args.skip_bpe:
@@ -101,9 +108,9 @@ def main() -> None:
             pretokenizer=args.pretokenizer,
         )
         b_time = time.perf_counter() - t0
-        b_path = named("ours_bpe")
+        b_path = named("gigatoken")
         common.save_hf_tokenizer(common.to_hf_bpe(b_vocab, b_merges, use_regex=True), b_path)
-        manifest["tokenizers"]["ours_bpe"] = {
+        manifest["tokenizers"]["gigatoken"] = {
             "path": b_path,
             "vocab_size": len(b_vocab),
             "train_time_s": round(b_time, 3),

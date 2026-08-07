@@ -64,9 +64,9 @@ def efficiency_section(data: dict, out: list[str]) -> None:
         return
     out.append(f"_{_meta_line(data.get('meta', {}))}_\n")
     out.append("Higher bytes/token = fewer tokens for the same text = more efficient. "
-               "The controlled result is **our SuperBPE vs our BPE at identical vocab** "
-               "(only the whitespace restriction differs); other rows are reference points "
-               "at their own vocab sizes.\n")
+               "The controlled result is **supergigatoken's SuperBPE vs gigatoken's plain BPE "
+               "at identical vocab** (only the whitespace restriction differs); other rows are "
+               "reference points at their own vocab sizes.\n")
     rows = sorted(
         data.get("tokenizers", {}).items(),
         key=lambda kv: (GROUP_ORDER.get(kv[1].get("group"), 9), -(kv[1].get("bytes_per_token") or 0)),
@@ -78,12 +78,12 @@ def efficiency_section(data: dict, out: list[str]) -> None:
                    f"{rec.get('vocab_size')} | **{rec.get('bytes_per_token')}** | {rec.get('tokens')} |")
     out.append("")
     ours = {n: r for n, r in data.get("tokenizers", {}).items() if r.get("group") == "ours"}
-    sb = ours.get("ours_superbpe")
-    bpe = ours.get("ours_bpe")
+    sb = ours.get("supergigatoken")
+    bpe = ours.get("gigatoken")
     if sb and bpe and bpe.get("bytes_per_token"):
         gain = sb["bytes_per_token"] / bpe["bytes_per_token"]
         tok_red = 1 - (sb.get("tokens", 0) / bpe["tokens"]) if bpe.get("tokens") else None
-        line = f"At matched vocab, our SuperBPE reaches **{gain:.2f}x** the bytes/token of plain BPE"
+        line = f"At matched vocab, supergigatoken reaches **{gain:.2f}x** the bytes/token of gigatoken's plain BPE"
         if tok_red is not None:
             line += f" — **{tok_red * 100:.1f}% fewer tokens** for the same text"
         out.append(line + ".\n")
@@ -127,7 +127,7 @@ def parity_section(data: dict, out: list[str]) -> None:
                    f"{round(frac * 100, 2) if frac is not None else '-'} | {rec.get('bytes_per_token', '-')} |")
     out.append("")
     if "train_speedup_vs_reference" in data:
-        out.append(f"gigatoken's `train_superbpe` trains in **{data['train_speedup_vs_reference']}x** "
+        out.append(f"supergigatoken's `train_superbpe` trains in **{data['train_speedup_vs_reference']}x** "
                    "the reference's wall-clock (higher = faster).\n")
     ex = None
     for _, rec in data.get("sides", {}).items():

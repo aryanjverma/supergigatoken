@@ -1,6 +1,6 @@
 {
   "meta": {
-    "corpus": "~/data/owt_train.txt",
+    "corpus": "C:/Users/aryan/data/owt_train.txt",
     "cpu": "Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores)",
     "eval_mb": 99.74,
     "note": "outcome parity (speed + quality), not byte-identical merges",
@@ -17,11 +17,11 @@
   "sides": {
     "ours": {
       "bytes_per_token": 5.8498,
-      "engine": "gigatoken train_superbpe",
+      "engine": "supergigatoken train_superbpe",
       "measured_vocab": 50000,
       "n_superwords": 8118,
-      "stage1_time_s": null,
-      "stage2_time_s": null,
+      "stage1_time_s": 1.977,
+      "stage2_time_s": 26.078,
       "superword_examples": [
         "Media playback is unsupported on your device Media caption",
         "Advertisement Continue reading the main story",
@@ -38,7 +38,7 @@
       ],
       "superword_fraction": 0.1624,
       "tokens": 17050313,
-      "train_time_s": 27.044,
+      "train_time_s": 28.069,
       "vocab_size": 50000
     },
     "reference": {
@@ -68,5 +68,5 @@
       "vocab_size": 50000
     }
   },
-  "train_speedup_vs_reference": 8.26
+  "train_speedup_vs_reference": 7.96
 }

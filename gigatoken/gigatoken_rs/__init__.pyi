@@ -78,6 +78,7 @@ def train_superbpe(
     separator: bytes | None = None,
     max_unit_len: int = 128,
     pretokenizer: str = "gpt2",
+    timings: dict[str, float] | None = None,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Train a SuperBPE tokenizer. Stage 1 is ordinary whitespace-
     pretokenized BPE up to `transition_point` tokens; stage 2 lifts
@@ -91,7 +92,11 @@ def train_superbpe(
     match the original SuperBPE trainer's stage-1 regex, whose letter
     classes include `\\p{M}` so combining marks stay inside their letter
     run; the "gpt2" default excludes `\\p{M}` and fragments scripts that
-    write vowels as marks (e.g. Devanagari)."""
+    write vowels as marks (e.g. Devanagari).
+
+    Pass a dict as `timings` to receive the per-stage wall-clock split
+    ("stage1_s", "stage2_s"); the stages have no Python-visible boundary,
+    so they cannot be timed from the caller."""
 
 class PadTruncate:
     """How encode_batch_padded assembles rows into a rectangular matrix; see

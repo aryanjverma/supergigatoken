@@ -31,7 +31,7 @@
       },
       "path": "C:\\Users\\aryan\\.cache\\huggingface\\hub\\models--alisawuffles--superbpe-tokenizer-128k\\snapshots\\fdccc3c5d6826f0c5ef39e4cbe9ea6cb9a813f61\\tokenizer.json"
     },
-    "ours_bpe": {
+    "gigatoken": {
       "engines": {
         "gigatoken": {
           "bytes": 99740832,
@@ -50,10 +50,10 @@
           "tokens": 22194723
         }
       },
-      "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\ours_bpe.json",
+      "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\gigatoken.json",
       "speedup_vs_hf": 1479.96
     },
-    "ours_superbpe": {
+    "supergigatoken": {
       "engines": {
         "gigatoken": {
           "bytes": 99740832,
@@ -72,7 +72,7 @@
           "tokens": 17603858
         }
       },
-      "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\ours_superbpe.json",
+      "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\supergigatoken.json",
       "speedup_vs_hf": 22.7
     }
   }
