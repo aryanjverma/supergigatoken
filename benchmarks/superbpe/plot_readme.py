@@ -216,7 +216,11 @@ def _plot_vs_original(plt, out: str) -> None:
         bars = axC.barh(names, vals, color=cols, edgecolor="white", linewidth=1.0, zorder=3, height=0.6)
         for rect, v in zip(bars, vals):
             axC.text(v + 0.012, rect.get_y() + rect.get_height() / 2, f"{v:.3f}", va="center", fontsize=10.5, fontweight="bold")
-        axC.set_xlim(0, 1.13)
+        # Headroom past 1.0 is for the value labels, not the bars. The Spearman
+        # row is ~0.999, so its label starts at the far right of the data range
+        # and needs its full glyph width inside the frame; at 1.13 the bold
+        # "0.999" ran into the right spine.
+        axC.set_xlim(0, 1.26)
         axC.set_xlabel("agreement with the original (1.0 = identical)")
         axC.set_title("They learn nearly the same tokenizer", fontweight="bold")
         axC.grid(True, axis="x", alpha=0.25)
@@ -237,8 +241,7 @@ def _plot_vs_original(plt, out: str) -> None:
     fig.text(
         0.5,
         0.925,
-        f"same {mb} MB OpenWebText slice · vocab {vocab} · transition {trans} · "
-        f"identical stage-1 regex ({s.get('pretokenizer', '?')})",
+        f"same {mb} MB OpenWebText slice · vocab {vocab} · transition {trans} · identical stage-1 regex ({s.get('pretokenizer', '?')})",
         ha="center",
         fontsize=10,
         color="#4b5563",
@@ -299,7 +302,9 @@ def _plot_throughput(plt, out: str) -> None:
     # speedup annotations where both engines ran
     for xi, g, h in zip(x, giga, hf):
         if g and h:
-            ax.annotate(f"{g / h:.1f}× faster", (xi - w / 2, g * 0.5), textcoords="offset points", xytext=(-48, 0), ha="right", va="center", fontsize=10, fontweight="bold", color=BLUE)
+            ax.annotate(
+                f"{g / h:.1f}× faster", (xi - w / 2, g * 0.5), textcoords="offset points", xytext=(-48, 0), ha="right", va="center", fontsize=10, fontweight="bold", color=BLUE
+            )
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylabel("MB / s  (higher = faster)")
