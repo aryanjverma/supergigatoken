@@ -4,7 +4,7 @@
 
 **Fast Rust trainers for BPE *and* SuperBPE — and a fast encoder for both.**
 
-*Train a 50k tokenizer in seconds, a 50k SuperBPE in minutes, then encode at hundreds of MB/s: **3.8× faster training** and **91× faster encoding** than HuggingFace `tokenizers`, on a SuperBPE that packs ~20% more text into every token.*
+*Train a 50k tokenizer in seconds, a 50k SuperBPE in minutes, then encode at hundreds of MB/s: **8× faster training** and **91× faster encoding** than HuggingFace `tokenizers`, on a SuperBPE that packs ~20% more text into every token.*
 
 ![supergigatoken vs the original SuperBPE](assets/superbpe_vs_original.png)
 
