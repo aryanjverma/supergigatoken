@@ -99,9 +99,16 @@ use std::marker::PhantomData;
 /// `well-known`, `don't` and `(word` into single units under GPT2's
 /// ` ?\p{L}+`. So `derive_threshold` treats the rule set as part of the plan
 /// it derives: it probes both and keeps `wide` only when the threshold it buys
-/// is strictly larger. The released 128k goes 485 → 100164 on it; the 50k
+/// is strictly larger. The released 128k selects it and lands at 85956; the 50k
 /// artifact reaches 40000 either way, stays narrow, and re-measured at
-/// 163.5 MB/s once selection was in place.
+/// 163.5 MB/s once selection was in place. (485 → 13471 is what `wide` alone
+/// bought the release, before [`non_ascii_pair`] took it the rest of the way, so
+/// 485 is a pre-`non_ascii_pair` figure and not today's narrow probe.)
+///
+/// The last unconditional rule, [`non_ascii_pair`], is documented on its own
+/// below: it is what keeps *fragment* merges from capping either checkpoint
+/// (13471 and 24013 respectively) and is not part of this selection, because a
+/// vocabulary that needs it needs it for correctness.
 ///
 /// `wide` is a parameter rather than a const generic because
 /// `bpe::superword::Level1Units` walks a *runtime* scheme and cannot
@@ -118,6 +125,45 @@ pub(crate) fn glues(prev: &[u8], next: &[u8], wide: bool) -> bool {
         || prev.last() == Some(&b'\'')
         || prev.first() == Some(&b'\'')
         || next.first().is_some_and(|&b| is_digit(b))
+        || non_ascii_pair(prev, next)
+}
+
+/// Whether the characters on *both* sides of the junction are non-ASCII.
+///
+/// A byte `>= 0x80` at a pretoken's end is either a lead byte or a
+/// continuation byte, and in both cases the character it belongs to is
+/// multi-byte; likewise at a pretoken's start. So two comparisons decide the
+/// question exactly, with no decode — this is the cheapest rule here.
+///
+/// It is the rule that makes *fragment* merges tractable. Byte-level BPE learns
+/// merges whose operands are pieces of characters, and for those the character
+/// at the junction is not in the merge at all — only its first byte or two are.
+/// The released 128k's merge 13471 is `"ا"` + `b"\xd8"`: that lead byte reaches
+/// U+0600–U+063F, which holds Arabic *letters* and ARABIC COMMA U+060C alike,
+/// so `bpe::superword::derive_threshold` cannot know which class follows and
+/// has to assume the splitting one. Without this rule the released 128k caps at
+/// **13471** and the committed 50k artifact at **24013**, both far below their
+/// transition points — and before this rule existed `derive_threshold` skipped
+/// those junctions instead, which is what made the released 128k encode
+/// `"ا،"` as `[5438, 48629]` where HuggingFace gives `[13471, 221]`.
+///
+/// Unconditional rather than part of `wide`, because every byte-level
+/// vocabulary trained on multilingual text has fragment merges, and because it
+/// is the one rule whose cost is bounded by the corpus rather than the
+/// tokenizer: it can only fire between two non-ASCII characters, which English
+/// prose does not contain.
+///
+/// Cost on the committed artifact, which needs it for correctness but never
+/// fires it on this corpus: `bench_superword_variants` twophase+cuts read
+/// **155.3 MB/s** against 163.5 before, min of 5 over the same 33.5 MB of OWT.
+/// That −5.0% is not the rule. Every one of the bench's six arms moved by the
+/// same amount, and `bench_released_128k_vs_plain`'s *plain* arm — which never
+/// calls this function, having no level 1 — read 31.6 against 33.4 in the same
+/// session, −5.4%. The two byte comparisons are below what this box resolves
+/// between sessions.
+#[inline(always)]
+pub(crate) fn non_ascii_pair(prev: &[u8], next: &[u8]) -> bool {
+    matches!((prev.last(), next.first()), (Some(&p), Some(&n)) if p >= 0x80 && n >= 0x80)
 }
 
 /// Decode the last character of `s` and report whether it is whitespace.
@@ -632,21 +678,28 @@ mod tests {
         // first two superwords have one.
         for (prev, next) in [
             (&b" !"[..], &b" x"[..]),
-            (&b" of"[..], &b" the"[..]), // the transition point at 100164
+            (&b" of"[..], &b" the"[..]), // the release's first true superword, 100164
             (&b" don"[..], &b"'t"[..]),  // 100195
             (&b"4"[..], &b" the"[..]),
-            // A leading combining mark is `CharClass::Other`, so `" ن" | "َ"`
-            // (Arabic letter, then fatha) does not glue. That is a boundary
-            // only under the `GPT2` candidate scheme, whose ` ?\p{L}+` drops
-            // `\p{M}` from the letter run — it caps *that* candidate at 55927,
-            // and `derive_threshold` discards it because `SuperBPEStage1`
-            // reaches 100164. Gluing marks would raise the GPT2 threshold;
-            // nothing here needs it, and the claim it rests on is weaker (see
-            // `starts_with_word`), so this stays measured rather than assumed.
-            (&b" \xd9\x86"[..], &b"\xd9\x8e"[..]),
         ] {
             assert!(!glues(prev, next, false), "{prev:?} | {next:?} must not glue");
             assert!(!glues(prev, next, true), "{prev:?} | {next:?} must not glue under wide");
+        }
+
+        // The non-ASCII rule, unconditional and decided by one byte per side.
+        for (prev, next) in [
+            (&b"\xd8\xa7"[..], &b"\xd8\x8c"[..]), // "ا" | "،" — merge 13471's junction
+            (&b" \xd9\x86"[..], &b"\xd9\x8e"[..]), // Arabic letter, then fatha
+            (&b"\xb4"[..], &b"\xeb\xa6\xac"[..]), // a *fragment* left side still ends non-ASCII
+        ] {
+            assert!(non_ascii_pair(prev, next), "{prev:?} | {next:?} is a non-ASCII pair");
+            assert!(glues(prev, next, false), "{prev:?} | {next:?} must glue");
+            assert!(glues(prev, next, true), "{prev:?} | {next:?} must glue under wide");
+        }
+        // One ASCII side is enough to fall through to the other rules, which is
+        // what keeps English prose split at every word boundary.
+        for (prev, next) in [(&b" of"[..], &b"\xd8\x8c"[..]), (&b"\xd8\xa7"[..], &b","[..])] {
+            assert!(!non_ascii_pair(prev, next), "{prev:?} | {next:?} is not a non-ASCII pair");
         }
     }
 

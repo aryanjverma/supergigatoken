@@ -98,8 +98,10 @@ def throughput_section(data: dict, out: list[str]) -> None:
     out.append(f"_{_meta_line(meta)}"
                + (f" · min of {meta.get('repeats')} repeats" if meta.get("repeats") else "")
                + "_\n")
-    out.append("gigatoken fast-encodes a SuperBPE tokenizer via the `Superword` pretokenizer "
-               "(whitespace lifted). tiktoken is skipped — it cannot represent SuperBPE.\n")
+    out.append("gigatoken fast-encodes a SuperBPE tokenizer through the two-level `Superword` encoder — "
+               "over the `superword` scheme for the tokenizers trained here (whitespace fully lifted) and "
+               "over `superword_bounded` for the released checkpoint, whose exported `Split` regex keeps a "
+               "few outer boundaries. tiktoken is skipped — it cannot represent SuperBPE.\n")
     out.append("| Tokenizer | gigatoken MB/s | HF MB/s | speedup | gigatoken Mtok/s | HF Mtok/s |")
     out.append("|---|---:|---:|---:|---:|---:|")
     for name, rec in data.get("tokenizers", {}).items():

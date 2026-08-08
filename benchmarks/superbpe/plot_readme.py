@@ -293,7 +293,11 @@ def _plot_throughput(plt, out: str) -> None:
     x = np.arange(len(names))
     w = 0.38
     fig, ax = plt.subplots(figsize=(max(5.5, 2.8 * len(names) + 2.4), 4.6))
-    ax.set_xlim(-0.7, len(names) - 0.3)
+    # The speedup annotations hang 48pt to the *left* of each gigatoken bar,
+    # which for group 0 is only 0.19 units from the frame -- -0.7 clipped the
+    # leading digit of a 3-digit "114.9x faster" once the released 128k added a
+    # second group. Widened to fit the widest label the data can produce.
+    ax.set_xlim(-0.95, len(names) - 0.3)
     b1 = ax.bar(x - w / 2, giga, w, label="supergigatoken (gigatoken engine)", color=BLUE, edgecolor="white", zorder=3)
     b2 = ax.bar(x + w / 2, hf, w, label="HuggingFace tokenizers", color=GRAY, edgecolor="white", zorder=3)
     for rect, v in list(zip(b1, giga)) + list(zip(b2, hf)):

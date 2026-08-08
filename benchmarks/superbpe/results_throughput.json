@@ -17,63 +17,68 @@
     "alisawuffles/superbpe-tokenizer-128k": {
       "engines": {
         "gigatoken": {
+          "bytes": 99740832,
           "engine": "gigatoken",
-          "error": "Unknown pre_tokenizer Split regexes, no fast pretokenizer for: [\"\\\\p{N}{1,3}| ?[^\\\\s\\\\p{L}\\\\p{N}]{2,}[\\\\r\\\\n/]*| +(?!\\\\S"
+          "mb_per_s": 310.55,
+          "mtokens_per_s": 49.84,
+          "time_s": 0.3212,
+          "tokens": 16007082
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 6.1,
-          "mtokens_per_s": 0.978,
-          "time_s": 16.3616,
+          "mb_per_s": 4.9,
+          "mtokens_per_s": 0.786,
+          "time_s": 20.3675,
           "tokens": 16007082
         }
       },
-      "path": "C:\\Users\\aryan\\.cache\\huggingface\\hub\\models--alisawuffles--superbpe-tokenizer-128k\\snapshots\\fdccc3c5d6826f0c5ef39e4cbe9ea6cb9a813f61\\tokenizer.json"
+      "path": "C:\\Users\\aryan\\.cache\\huggingface\\hub\\models--alisawuffles--superbpe-tokenizer-128k\\snapshots\\fdccc3c5d6826f0c5ef39e4cbe9ea6cb9a813f61\\tokenizer.json",
+      "speedup_vs_hf": 63.38
     },
     "gigatoken": {
       "engines": {
         "gigatoken": {
           "bytes": 99740832,
           "engine": "gigatoken",
-          "mb_per_s": 2290.85,
-          "mtokens_per_s": 509.77,
-          "time_s": 0.0435,
+          "mb_per_s": 2297.11,
+          "mtokens_per_s": 511.161,
+          "time_s": 0.0434,
           "tokens": 22194723
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 4.12,
-          "mtokens_per_s": 0.917,
-          "time_s": 24.2075,
+          "mb_per_s": 3.98,
+          "mtokens_per_s": 0.885,
+          "time_s": 25.084,
           "tokens": 22194723
         }
       },
       "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\gigatoken.json",
-      "speedup_vs_hf": 556.03
+      "speedup_vs_hf": 577.16
     },
     "supergigatoken": {
       "engines": {
         "gigatoken": {
           "bytes": 99740832,
           "engine": "gigatoken",
-          "mb_per_s": 618.19,
-          "mtokens_per_s": 109.109,
-          "time_s": 0.1613,
+          "mb_per_s": 730.0,
+          "mtokens_per_s": 128.842,
+          "time_s": 0.1366,
           "tokens": 17603858
         },
         "hf": {
           "bytes": 99740832,
           "engine": "hf",
-          "mb_per_s": 6.76,
-          "mtokens_per_s": 1.192,
-          "time_s": 14.7635,
+          "mb_per_s": 6.27,
+          "mtokens_per_s": 1.106,
+          "time_s": 15.9176,
           "tokens": 17603858
         }
       },
       "path": "C:\\Users\\aryan\\projects\\supergigatoken\\benchmarks\\superbpe\\artifacts\\supergigatoken.json",
-      "speedup_vs_hf": 91.45
+      "speedup_vs_hf": 116.43
     }
   }
 }

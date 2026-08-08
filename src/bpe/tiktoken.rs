@@ -2019,9 +2019,31 @@ mod tests {
     /// than the plain path it exists to beat.
     const RELEASED_128K_TRANSITION: u32 = 100_164;
 
-    /// `derive_threshold` must reach the transition point on the real
+    /// What `derive_threshold` actually reaches on the release: **85956**, or
+    /// 85.8% of the way to the transition point above.
+    ///
+    /// The gap is not slack in the probe — it is one merge that genuinely sits
+    /// on a level-1 boundary below the transition. 85956 is `b"\x8a"` + `b"\n"`:
+    /// a *lone continuation byte*, the tail of some multi-byte character, joined
+    /// to a newline. Byte-level BPE builds characters up from fragments, so such
+    /// a token exists, and the character it ends can be a letter — `b"\x8a"`
+    /// completes to り (`b"\xe3\x82\x8a"`) among many others. Letter-then-newline
+    /// is a stage-1 boundary under both candidate schemes, so level 1 splits
+    /// exactly where this merge would have to fire.
+    ///
+    /// That makes 100164 the release's *semantic* transition (the first merge
+    /// that spans whitespace by intent) but not a safe threshold: the bound has
+    /// to hold for every merge below it, including the fragment ones nobody
+    /// designed. Encoding this checkpoint against HF is what surfaced it —
+    /// admitting a fragment junction as safe cost 5 tokens in 16,007,082 on the
+    /// OWT eval slice, all in one Arabic document.
+    const RELEASED_128K_THRESHOLD: u32 = 85_956;
+
+    /// `derive_threshold` must reach [`RELEASED_128K_THRESHOLD`] on the real
     /// released vocabulary — the gate on the whole two-level premise for this
-    /// tokenizer.
+    /// tokenizer. It is close enough to [`RELEASED_128K_TRANSITION`] that level
+    /// 1 carries essentially the whole stage-1 table; the constant's docs
+    /// explain the one merge in between.
     ///
     /// Built directly rather than read off `superword_threshold()`: this
     /// measures `derive_threshold`, and whether `enable_superword_two_level`
@@ -2038,7 +2060,30 @@ mod tests {
             tok.byte_remapping.as_ref(),
         )
         .map(|plan| plan.threshold);
-        assert_eq!(threshold, Some(RELEASED_128K_TRANSITION));
+        assert_eq!(threshold, Some(RELEASED_128K_THRESHOLD));
+        assert!(RELEASED_128K_THRESHOLD < RELEASED_128K_TRANSITION);
+    }
+
+    /// The `Junction::OpenLeft` arm caps the release at
+    /// [`RELEASED_128K_THRESHOLD`] by *assuming* the worst about a merge whose
+    /// left operand opens inside a character. This checks the assumption is not
+    /// merely conservative but exact: complete that operand and the boundary is
+    /// really there, so enumerating left completions — the mirror of
+    /// `open_right_can_split` — would buy nothing.
+    ///
+    /// Merge 85956 is `b"\x8a"` + `b"\n"`; `b"\xe3\x82\x8a"` is り. If a future
+    /// glue rule ever makes letter-then-newline safe, this fails and the arm is
+    /// worth replacing with enumeration.
+    #[test]
+    fn open_left_cap_is_a_real_boundary() {
+        for scheme in [PretokenizerType::SuperBPEStage1, PretokenizerType::GPT2] {
+            for wide in [false, true] {
+                assert!(
+                    superword::junction_can_split_for_test(b"\xe3\x82\x8a", b"\n", scheme, wide),
+                    "letter|newline must be a level-1 boundary for {scheme:?} (wide={wide})"
+                );
+            }
+        }
     }
 
     /// Corpus for the two-level differential: prose the artifact's superword
@@ -2062,6 +2107,21 @@ mod tests {
         "caf\u{e9} na\u{ef}ve \u{fc}ber \u{e9}l\u{e8}ve",
         "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{ff0c}\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}",
         "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} \u{92e}\u{947}\u{902} \u{932}\u{93f}\u{916}\u{93e}",
+        // The fragment-junction hazard, and the only case in this corpus that
+        // needs a *byte-level* rather than character-level argument. Merge 13471
+        // of the released 128k is (`"ا"`, `b"\xd8"`) — an Arabic letter plus the
+        // bare lead byte of the next character. Its junction is a real boundary
+        // (the character it opens can be ARABIC COMMA, U+060C), but the merge
+        // carries no whole character on the right, so a junction test that asks
+        // "do both sides decode?" reads it as interior and admits it below the
+        // threshold. Level 1 then cannot apply it across the letter|comma split
+        // and encodes `"ا،"` as `[5438, 48629]` where HF gives `[13471, 221]`.
+        // Cost when it shipped: 5 tokens in 16,007,082, in one document out of
+        // 19,937 — which is why the pin is here and not left to the corpus test.
+        "\u{627}\u{60c}",
+        "\u{627}\u{60c} \u{647}\u{627}\u{60c} \u{644}\u{627}\u{60c}",
+        "\u{62d}\u{627}\u{644}\u{62a}\u{647}\u{627}\u{60c} \u{64a}\u{637}\u{644}\u{628}",
+        "\u{627}\u{61f} \u{627}\u{6d4} a\u{627}\u{60c}a",
         "word  ,  word ;; word -- word",
         "1  2   34    567  8901",
         // The contraction hazard: `("'", "s")` is a low-ID merge because
@@ -2192,8 +2252,8 @@ mod tests {
         let mut two_level = load_hf_bpe(&path).expect("the released 128k must load");
         assert_eq!(
             two_level.superword_threshold(),
-            Some(RELEASED_128K_TRANSITION),
-            "the two-level plan must be installed at the transition point"
+            Some(RELEASED_128K_THRESHOLD),
+            "the two-level plan must be installed at the derived threshold"
         );
         let mut plain = load_hf_bpe(&path).expect("the released 128k must load");
         plain.disable_superword_two_level();
