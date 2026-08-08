@@ -264,3 +264,8 @@ __marimo__/
 # run, for one). The unsuffixed artifacts stay committed because Axis 1/2 and
 # the Rust superword tests load them; a suffixed one is a 27-second retrain.
 /benchmarks/superbpe/artifacts/*_s1_*.json
+
+# The rendered brief. Unlike REPORT.md and assets/*.png, nothing reads this one
+# back -- it is a leaf deliverable, so `make_brief.py` is the committed artifact
+# and the .docx is a one-command rebuild.
+/benchmarks/superbpe/*.docx
