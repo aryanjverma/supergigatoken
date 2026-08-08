@@ -123,29 +123,67 @@ const CANDIDATE_SCHEMES: [PretokenizerType; 2] =
 const VERIFY_PAD: [&[u8]; 8] = [b"", b"x", b" ", b"  ", b"\n", b"1", b"!", b"'"];
 
 /// Level-1 splitting for the two-level encode over the *runtime*
-/// pretokenizer enum: the stage-1 scheme's pretokens, with adjacent
-/// pretokens glued across the four junction shapes a low-ID merge can span
-/// (see the module docs for the merge IDs each one otherwise costs) —
+/// pretokenizer enum: the stage-1 scheme's pretokens, with adjacent pretokens
+/// glued across the junction shapes a low-ID merge can span.
 ///
-/// - **whitespace on both sides**, which the `\s+(?!\S)` lookahead can cut
-///   mid-run: `"a  b"` yields `"a"` and `"  b"` instead of `"a"`, `" "`,
-///   `" b"`;
-/// - **a left side ending in an apostrophe**, because the contraction
-///   alternative makes `'s` its own pretoken — so `("'", "s")` is a low
-///   merge — while a greedy punctuation run swallows the apostrophe in
-///   `"x!'s"`, putting a boundary between them. Glued, `"!'"` and `"s"` stay
-///   in one unit.
-/// - **a left side *starting* with an apostrophe**, the contraction seen from
-///   its other end: `"'st"` splits as `"'s"`, `"t"`, so every contraction tail
-///   (`s`, `t`, `re`, `ve`, `m`, `ll`, `d`) is a hazardous left operand.
-///   Glued, `"'s"` and `"t"` stay together.
-/// - **a right side starting with a digit**, since `superbpe_stage1`'s
-///   `\p{N}{1,3}` takes no leading space and caps runs at three: `" "`+`"1"`
-///   and `"000"`+`"0"` both rejoin.
+/// Two rules carry almost all of it, and each one's cost in threshold is
+/// measured, not argued. Both are gated on `wide`, because they also have a
+/// cost in *throughput* — see below:
 ///
-/// All four are rare in prose, so the cache reuse level 1 exists for is intact.
-/// No rule is load-bearing on its own: [`derive_threshold`] probes *this*
-/// splitter, so a hazard the rules miss lowers the threshold instead of
+/// - **a right side starting with `\p{L}` or `\p{N}`.** Every stage-1
+///   alternative that can open a pretoken with a word character opens a fresh
+///   run there, so such a merge is reachable inside one stage-1 pretoken and
+///   is a stage-1 merge, not a superword. Unglued, `("’", "s")` caps the
+///   released 128k at **485**: stage 1's punctuation run is
+///   ` ?[^\s\p{L}\p{N}]+`, so `" ’s"` splits into `" ’"` and `"s"`. The class
+///   continues `’|t` 682, `-|s` 1269, `’|re` 1549, `.|S` 1920 — and it also
+///   covers the o200k family's case-structured letter runs (`" Mc"`+`"C"`,
+///   `" You"`+`"Tube"`) and `\p{N}{1,3}`'s digit rejoin (`"000"`+`"0"`).
+/// - **a right side starting with whitespace, after a left side ending in
+///   `\p{M}`.** The punctuation alternative swallows a `[\r\n/]*` tail, so
+///   punctuation followed by a newline is usually one pretoken already — but
+///   `\p{M}` reaches the *letter* alternative, which has no such tail, so
+///   `("\u{fe0f}", "\n")` is a genuine boundary and caps the vocabulary at
+///   **91476**. Gluing every non-word left side instead — which also subsumes
+///   the whitespace-on-both-sides case — buys no further threshold and costs
+///   another 2.8 points of throughput, so the rule is exactly as wide as the
+///   measurement asked for.
+///
+/// The whitespace-on-both-sides case that the `\s+(?!\S)` lookahead creates by
+/// cutting a run mid-way (`"a  b"` yields `"a"`, `"  b"`) is therefore its own
+/// rule, and unconditional: the fill can split a whitespace run for reasons of
+/// its own, so this one is about the walkers agreeing, not about a vocabulary.
+///
+/// Two apostrophe rules are likewise unconditional, both from the contraction
+/// alternative: a left side **ending** in `'`, because `("'", "s")` is a low
+/// merge while a greedy punctuation run puts a boundary inside `"x!'s"`; and a
+/// left side **starting** with `'`, the same seen from its other end, since
+/// `"'st"` splits as `"'s"`, `"t"` for every contraction tail. So is the digit
+/// rejoin, `\p{N}{1,3}`'s split inside a longer run.
+///
+/// What `wide` leaves as a split point is a word character followed by
+/// whitespace or punctuation — exactly the two shapes a real superword needs
+/// (`" of"`+`" the"` at 100164, `" don"`+`"'t"` at 100195). Every prose word
+/// boundary is one, so the cache reuse level 1 exists for survives.
+///
+/// # Why the rule set is derived rather than global
+///
+/// Gluing more is always sound: it only removes split points, and removing all
+/// of them is the plain path. It is not always *free*. Coarser units are rarer
+/// cache keys, and on the committed 50k artifact — whose threshold is its
+/// transition point under the narrow rules alone — the two `wide` rules
+/// measured **147.9 vs 163.9 MB/s**, −9.8% (`bench_superword_variants`,
+/// twophase+cuts, min of 5 over 33.5 MB of OWT), from collapsing `well-known`,
+/// `don't` and `(word` into single units under GPT2's ` ?\p{L}+`.
+///
+/// So the rule set joins the scheme as something [`derive_threshold`] is probed
+/// for rather than told: [`SuperwordPlan::build_capped`] tries all four
+/// (scheme, `wide`) combinations and keeps `wide` only where it buys strictly
+/// more prefix. The released 128k needs it and goes 485 → 100164; the 50k
+/// artifact does not, stays narrow, and re-measured at 163.5 MB/s.
+///
+/// No rule is load-bearing on its own either: [`derive_threshold`] probes
+/// *this* splitter, so a hazard the rules miss lowers the threshold instead of
 /// changing anyone's tokens.
 ///
 /// The encode path does not run this walker — it runs
@@ -156,16 +194,21 @@ const VERIFY_PAD: [&[u8]; 8] = [b"", b"x", b" ", b"  ", b"\n", b"1", b"!", b"'"]
 pub(crate) struct Level1Units<'a> {
     bytes: &'a [u8],
     inner: FastPretokenizerDispatch<'a>,
+    /// The plan's glue rule set, `glues`'s `wide`. A runtime field here — this
+    /// walker's scheme is a runtime value, so unlike the fill it cannot read the
+    /// flag off a scheme type.
+    wide: bool,
     /// Byte offsets of a pretoken pulled from `inner` that did not glue onto
     /// the unit just returned, and so starts the next one.
     pending: Option<(usize, usize)>,
 }
 
 impl<'a> Level1Units<'a> {
-    pub(crate) fn new(bytes: &'a [u8], scheme: PretokenizerType) -> Self {
+    pub(crate) fn new(bytes: &'a [u8], scheme: PretokenizerType, wide: bool) -> Self {
         Level1Units {
             bytes,
             inner: scheme.pretokenize(bytes),
+            wide,
             pending: None,
         }
     }
@@ -201,7 +244,11 @@ impl<'a> Level1Units<'a> {
         let mut prev_start = start;
         while let Some((next_start, next_end)) = self.next_inner() {
             debug_assert_eq!(next_start, end, "pretokens are consecutive");
-            if glues(&self.bytes[prev_start..end], &self.bytes[next_start..next_end]) {
+            if glues(
+                &self.bytes[prev_start..end],
+                &self.bytes[next_start..next_end],
+                self.wide,
+            ) {
                 prev_start = next_start;
                 end = next_end;
             } else {
@@ -296,7 +343,7 @@ fn junction_chars(a: &[u8], b: &[u8]) -> Option<(char, char)> {
 /// `camelCase` between two letters, and its `\p{N}{1,3}` splits a digit run
 /// every three digits. Leaving the real pretokenizers as the only authority
 /// on where boundaries fall is what keeps this honest when a scheme is added.
-fn junction_can_split(left: &[u8], right: &[u8], scheme: PretokenizerType) -> bool {
+fn junction_can_split(left: &[u8], right: &[u8], scheme: PretokenizerType, wide: bool) -> bool {
     let mut probe = Vec::with_capacity(left.len() + right.len() + 8);
     for pad_left in VERIFY_PAD {
         for pad_right in VERIFY_PAD {
@@ -306,7 +353,7 @@ fn junction_can_split(left: &[u8], right: &[u8], scheme: PretokenizerType) -> bo
             let junction = probe.len();
             probe.extend_from_slice(right);
             probe.extend_from_slice(pad_right);
-            if splits_at(&probe, junction, scheme) {
+            if splits_at(&probe, junction, scheme, wide) {
                 return true;
             }
         }
@@ -336,6 +383,7 @@ pub(crate) fn derive_threshold(
     vocab: &[Arc<[u8]>],
     merges: &HashMap<(TokenId, TokenId), TokenId, FxBuildHasher>,
     scheme: PretokenizerType,
+    wide: bool,
 ) -> Option<u32> {
     let mut by_id: Vec<(u32, TokenId, TokenId)> = merges
         .iter()
@@ -348,7 +396,7 @@ pub(crate) fn derive_threshold(
         let (Some(a), Some(b)) = (vocab.get(left.0 as usize), vocab.get(right.0 as usize)) else {
             continue;
         };
-        if junction_chars(a, b).is_some() && junction_can_split(a, b, scheme) {
+        if junction_chars(a, b).is_some() && junction_can_split(a, b, scheme, wide) {
             return Some(id);
         }
     }
@@ -356,9 +404,9 @@ pub(crate) fn derive_threshold(
 }
 
 /// Whether a level-1 unit boundary falls exactly at byte offset `at`.
-fn splits_at(bytes: &[u8], at: usize, scheme: PretokenizerType) -> bool {
+fn splits_at(bytes: &[u8], at: usize, scheme: PretokenizerType, wide: bool) -> bool {
     let mut pos = 0;
-    for unit in Level1Units::new(bytes, scheme) {
+    for unit in Level1Units::new(bytes, scheme, wide) {
         pos += unit.0.len();
         if pos == at {
             return true;
@@ -512,6 +560,11 @@ pub(crate) struct SuperwordPlan {
     /// stage-1 encodings. Built once per load and forked per worker.
     pub(crate) stage1: Tokenizer,
     pub(crate) stage1_scheme: PretokenizerType,
+    /// The glue rule set `threshold` was derived under, and so the one level 1
+    /// must split with — `glues`'s `wide`. Part of the plan rather than a
+    /// global because the wide rules make units coarser, which costs level-1
+    /// cache hits on a vocabulary that does not need them (see `glues`).
+    pub(crate) stage1_wide_glue: bool,
     /// Merge-prefix bound: level 1 applies exactly the merges with a merged
     /// ID below this (see [`derive_threshold`]).
     pub(crate) threshold: u32,
@@ -597,8 +650,10 @@ impl SuperwordPlan {
     /// `bench_superword_glue_cost` can measure what a hazard costs *in one
     /// process*: the threshold is a load-time property, so the only way to A/B
     /// it is two plans, and reproducing an old glue rule set by capping is
-    /// exact — a hazard's whole effect is the threshold it forces — while
-    /// costing the shipped path nothing (no runtime branch in `glues`).
+    /// exact — a hazard's whole effect is the threshold it forces — without
+    /// adding a knob to the encode path. The one rule-set choice that *is* a
+    /// plan field, `stage1_wide_glue`, is there because it changes where units
+    /// end and not only which merges are level 1; capping cannot express it.
     pub(crate) fn build_capped(
         vocab: &Arc<Vec<Arc<[u8]>>>,
         vocab_inv: &HashMap<Arc<[u8]>, TokenId, FxBuildHasher>,
@@ -606,12 +661,20 @@ impl SuperwordPlan {
         byte_remapping: Option<&crate::bpe::ByteRemapping>,
         cap: u32,
     ) -> Option<SuperwordPlan> {
-        let (scheme, threshold) = CANDIDATE_SCHEMES
+        // Both stage-1 schemes and both glue rule sets, largest prefix wins:
+        // a larger prefix leaves less work for level 2. `false` before `true`
+        // and a non-strict `max_by_key` (which keeps the *last* maximum) would
+        // pick the wide rules on a tie, so the order is reversed — the narrow
+        // rules win when they reach the same threshold, and a vocabulary only
+        // pays for coarser units when they actually buy prefix.
+        let (scheme, wide, threshold) = CANDIDATE_SCHEMES
             .iter()
-            .filter_map(|&scheme| Some((scheme, derive_threshold(vocab, merges, scheme)?)))
-            // A larger prefix leaves less work for level 2.
-            .max_by_key(|&(_, threshold)| threshold)
-            .map(|(scheme, threshold)| (scheme, threshold.min(cap)))?;
+            .flat_map(|&scheme| [(scheme, true), (scheme, false)])
+            .filter_map(|(scheme, wide)| {
+                Some((scheme, wide, derive_threshold(vocab, merges, scheme, wide)?))
+            })
+            .max_by_key(|&(_, _, threshold)| threshold)
+            .map(|(scheme, wide, threshold)| (scheme, wide, threshold.min(cap)))?;
 
         let stage1_merges: HashMap<(TokenId, TokenId), TokenId, FxBuildHasher> = merges
             .iter()
@@ -630,6 +693,7 @@ impl SuperwordPlan {
         Some(SuperwordPlan {
             stage1,
             stage1_scheme: scheme,
+            stage1_wide_glue: wide,
             threshold,
             cuts: Arc::new(SuperwordCuts::build(vocab, vocab_inv, merges, threshold)),
             symbols: Vec::new(),
@@ -644,6 +708,7 @@ impl SuperwordPlan {
         SuperwordPlan {
             stage1: self.stage1.fork_sized(expected_bytes),
             stage1_scheme: self.stage1_scheme,
+            stage1_wide_glue: self.stage1_wide_glue,
             threshold: self.threshold,
             cuts: Arc::clone(&self.cuts),
             symbols: Vec::new(),

@@ -572,6 +572,14 @@ pub(crate) fn digit_run_splits3(d: u64) -> u64 {
 
 /// The two per-scheme hooks of a mask-scanner pretokenizer.
 pub(crate) trait MaskScheme {
+    /// Which level-1 glue rules this instantiation applies when it is driving
+    /// a SuperBPE stage-1 split — [`level1::glues`](super::level1::glues)'s
+    /// `wide`. Read only under `GLUE = true`, so for every scheme that is not
+    /// a `Level1Fill` instantiation it const-folds away with the rest of the
+    /// glue path. `super::level1::WideGlue<Self>` is the same scheme with this
+    /// flipped; `bpe::superword::derive_threshold` chooses between them.
+    const LEVEL1_WIDE_GLUE: bool = false;
+
     /// Scalar ground truth: end of the token starting at `pos`
     /// (`pos < bytes.len()`, `pos` on a token boundary).
     fn advance(bytes: &[u8], pos: usize) -> usize;
@@ -1392,7 +1400,7 @@ impl MaskState {
             if GLUE {
                 // SAFETY: phase A wrote `nb` ascending pretoken ends
                 // relative to `fill_base`, all within `bytes`.
-                nb = unsafe { super::level1::glue_filter(bytes, fill_base, bufp, nb) };
+                nb = unsafe { super::level1::glue_filter::<S>(bytes, fill_base, bufp, nb) };
                 debug_assert!(!exhausted || nb > 0);
             }
 

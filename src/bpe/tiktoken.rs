@@ -1190,6 +1190,7 @@ impl Tokenizer {
                 &mut plan.stage1,
                 plan.l1_fill,
                 plan.stage1_scheme,
+                plan.stage1_wide_glue,
                 unit.0,
                 &mut plan.symbols,
             );
@@ -1230,20 +1231,21 @@ impl Tokenizer {
         stage1: &mut Tokenizer,
         l1_fill: superword::L1Fill,
         scheme: PretokenizerType,
+        wide: bool,
         unit: &[u8],
         out: &mut Vec<u32>,
     ) {
         if l1_fill == superword::L1Fill::TwoPhase {
-            if let Some(spans) = Level1Spans::new(unit, scheme) {
+            if let Some(spans) = Level1Spans::new(unit, scheme, wide) {
                 stage1.memoized_encode_flat(spans, out);
                 return;
             }
         }
         if l1_fill == superword::L1Fill::Buf {
-            stage1.memoized_encode_flat(Level1Units::new(unit, scheme), out);
+            stage1.memoized_encode_flat(Level1Units::new(unit, scheme, wide), out);
             return;
         }
-        stage1.memoized_encode_flat(SpanIter(Level1Units::new(unit, scheme)), out);
+        stage1.memoized_encode_flat(SpanIter(Level1Units::new(unit, scheme, wide)), out);
     }
 
     /// Level 2 of [`Self::superword_encode_segment`]: merge `plan.symbols` in
@@ -1312,6 +1314,7 @@ impl Tokenizer {
                 &mut plan.stage1,
                 plan.l1_fill,
                 plan.stage1_scheme,
+                plan.stage1_wide_glue,
                 unit.0,
                 out,
             );
@@ -1975,6 +1978,49 @@ mod tests {
             tok.encode_with_added_tokens_flat(text.as_bytes(), &mut got);
             assert_eq!(got, want, "ids differ from HF tokenizers on {text:?}");
         }
+    }
+
+    /// The released 128k's transition point, derived from merge order: the
+    /// first merge whose result contains a space at a non-leading position —
+    /// the first genuine cross-whitespace superword — is `ĠofĠthe`, token id
+    /// 100164 (merge index 99921). Exactly four sub-100k merges look
+    /// space-spanning and all are whitespace-only, which stage 1's `\s+`
+    /// produces as single pretokens: `ÂłĠ` (NBSP+space, 12215), `ÂłÂłĠ`
+    /// (17763), `ĉĠ` (tab+space, 38730), `ĉĉĠ` (98405). So the release is
+    /// t=100k on a 128k vocab.
+    ///
+    /// Reaching it needs the word-initial glue rule (`level1::glues`). With
+    /// only the whitespace/apostrophe/digit rules the threshold is **485**,
+    /// pinned by `"’" | "s"`: stage 1's punctuation alternative is
+    /// ` ?[^\s\p{L}\p{N}]+`, so `" ’s"` splits into `" ’"` and `"s"`, and the
+    /// class continues `’|t` 682, `-|s` 1269, `’|re` 1549, `.|S` 1920. At 485
+    /// level 1 applies almost no merges and two-level encoding is *slower*
+    /// than the plain path it exists to beat.
+    const RELEASED_128K_TRANSITION: u32 = 100_164;
+
+    /// `derive_threshold` must reach the transition point on the real
+    /// released vocabulary — the gate on the whole two-level premise for this
+    /// tokenizer.
+    ///
+    /// Built directly rather than read off `superword_threshold()`: this
+    /// measures `derive_threshold`, and whether `enable_superword_two_level`
+    /// admits the scheme is a separate decision made after this one.
+    #[test]
+    fn released_128k_threshold_reaches_transition_point() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = crate::test_hub::hf_tokenizer_json(RELEASED_128K_REPO) else {
+            eprintln!("Skipping: {RELEASED_128K_REPO} tokenizer.json not in the HF cache");
+            return;
+        };
+        let tok = load_hf_bpe(&path).expect("the released 128k must load");
+        let threshold = superword::SuperwordPlan::build(
+            &tok.vocab,
+            &tok.vocab_inv,
+            &tok.merges,
+            tok.byte_remapping.as_ref(),
+        )
+        .map(|plan| plan.threshold);
+        assert_eq!(threshold, Some(RELEASED_128K_TRANSITION));
     }
 
     /// Corpus for the two-level differential: prose the artifact's superword
