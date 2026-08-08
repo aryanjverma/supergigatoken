@@ -3,7 +3,7 @@ use crate::pretokenize::fast::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastKimiPretokenizer,
     FastNemotronPretokenizer, FastO200kPretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
-    FastSuperBPEStage1Pretokenizer, FastSuperwordPretokenizer,
+    FastSuperBPEStage1Pretokenizer, FastSuperwordBoundedPretokenizer, FastSuperwordPretokenizer,
 };
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
@@ -22,6 +22,11 @@ pub enum PretokenizerType {
     /// inside letter runs, unlike GPT2 — required for Devanagari and friends.
     SuperBPEStage1,
     Superword,  // whitespace-lifted: no splitting at all (ByteLevel use_regex=false); SuperBPE
+    /// The released SuperBPE inference scheme: stage 1 with the word
+    /// alternatives deleted, keeping only the digit-run / punct-run /
+    /// trailing-space bounds. Splits, unlike `Superword`, but never inside a
+    /// word — so a superword may still span whitespace.
+    SuperwordBounded,
 }
 
 /// The three Split regexes of the DeepSeek V3/V4 pre_tokenizer Sequence, as
@@ -74,13 +79,16 @@ impl PretokenizerType {
             PretokenizerType::Superword => {
                 FastPretokenizerDispatch::Superword(FastSuperwordPretokenizer::new(bytes))
             }
+            PretokenizerType::SuperwordBounded => FastPretokenizerDispatch::SuperwordBounded(
+                FastSuperwordBoundedPretokenizer::new(bytes),
+            ),
         }
     }
 
     /// The canonical name of each variant, in variant order — the
     /// identifiers `from_name` accepts (plus the aliases listed there).
     /// Error messages naming the valid schemes derive from this list.
-    pub const NAMES: [&'static str; 11] = [
+    pub const NAMES: [&'static str; 12] = [
         "gpt2",
         "gpt4",
         "qwen2",
@@ -92,6 +100,7 @@ impl PretokenizerType {
         "kimi",
         "superbpe_stage1",
         "superword",
+        "superword_bounded",
     ];
 
     /// The scheme named by a lowercase identifier, as used by loaders whose
@@ -111,6 +120,7 @@ impl PretokenizerType {
             "kimi" => PretokenizerType::Kimi,
             "superbpe_stage1" => PretokenizerType::SuperBPEStage1,
             "superword" => PretokenizerType::Superword,
+            "superword_bounded" => PretokenizerType::SuperwordBounded,
             _ => return None,
         })
     }
@@ -159,6 +169,13 @@ impl PretokenizerType {
             r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
                 Some(PretokenizerType::SuperBPEStage1)
             }
+            // The released SuperBPE tokenizers' inference regex: stage 1 with
+            // the word alternatives deleted, so only the bounds survive. `\r`
+            // and `\n` here are regex escapes (the JSON carried `\\r`), not
+            // literal control bytes — unlike DEEPSEEK_V3_SPLIT_REGEXES above.
+            r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*| +(?!\S)" => {
+                Some(PretokenizerType::SuperwordBounded)
+            }
             _ => None,
         }
     }
@@ -178,6 +195,7 @@ pub enum FastPretokenizerDispatch<'a> {
     Kimi(FastKimiPretokenizer<'a>),
     SuperBPEStage1(FastSuperBPEStage1Pretokenizer<'a>),
     Superword(FastSuperwordPretokenizer<'a>),
+    SuperwordBounded(FastSuperwordBoundedPretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -197,6 +215,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::Kimi(it) => it.next(),
             FastPretokenizerDispatch::SuperBPEStage1(it) => it.next(),
             FastPretokenizerDispatch::Superword(it) => it.next(),
+            FastPretokenizerDispatch::SuperwordBounded(it) => it.next(),
         }
     }
 }
@@ -225,6 +244,7 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::Kimi(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::SuperBPEStage1(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Superword(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::SuperwordBounded(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
 }

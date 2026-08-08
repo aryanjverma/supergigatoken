@@ -146,6 +146,15 @@ def olmo3_tokenizer_path() -> Path:
     return _hf_tokenizer_json("allenai/Olmo-3-1025-7B")
 
 
+@pytest.fixture(scope="session")
+def superbpe_128k_tokenizer_path() -> Path:
+    """Path to the released SuperBPE 128k tokenizer.json in the HF cache.
+
+    The tokenizer published with the SuperBPE paper: a `superword_bounded`
+    pre_tokenizer over a 128k vocab whose top ~28k merges span whitespace."""
+    return _hf_tokenizer_json("alisawuffles/superbpe-tokenizer-128k")
+
+
 # ---------------------------------------------------------------------------
 # GPT-2 byte <-> unicode helpers (reused by test_bpe_train_compare, etc.)
 # The canonical Python copy of the table lives in gigatoken._hf_compat.

@@ -1937,6 +1937,46 @@ mod tests {
     /// superword token ID is exactly 40000.
     const SUPERBPE_ARTIFACT: &str = "benchmarks/superbpe/artifacts/supergigatoken.json";
 
+    /// The tokenizer released with the SuperBPE paper. Its `pre_tokenizer` is
+    /// `Sequence[Split(<the bounded regex>, Isolated), ByteLevel(use_regex=false)]`,
+    /// which `from_split_regex` maps to `SuperwordBounded`; before that arm
+    /// existed the load failed outright with "Unknown pre_tokenizer Split
+    /// regexes".
+    const RELEASED_128K_REPO: &str = "alisawuffles/superbpe-tokenizer-128k";
+
+    /// The released 128k must load, pick the new scheme, and reproduce HF
+    /// `tokenizers`' ids. The expected ids are HF ground truth measured on
+    /// this tokenizer.json, not this implementation's output.
+    #[test]
+    fn released_128k_loads_with_superword_bounded() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = crate::test_hub::hf_tokenizer_json(RELEASED_128K_REPO) else {
+            eprintln!("Skipping: {RELEASED_128K_REPO} tokenizer.json not in the HF cache");
+            return;
+        };
+        let mut tok = load_hf_bpe(&path).expect("the released 128k must load");
+        assert_eq!(tok.pretokenizer_type, PretokenizerType::SuperwordBounded);
+        // 128000 model entries plus the one added token `<|endoftext|>` at id
+        // 128000, so the vocab table runs to 128001 slots.
+        assert_eq!(tok.vocab_size(), 128_001);
+        assert_eq!(tok.added_tokens.len(), 1);
+
+        // `"hi! there"` staying one pretoken is the scheme's defining
+        // property (a lone `!` fails `{2,}`), so these ids also witness that
+        // the outer split is the bounded one and not stage 1's.
+        for (text, want) in [
+            ("hi! there The quick brown fox", &[6292, 0, 530, 359, 1833, 5962, 18062][..]),
+            (
+                "camelCase McDonald and 12345 items",
+                &[66, 14552, 17446, 106605, 100319, 11066, 3099, 3675][..],
+            ),
+        ] {
+            let mut got: Vec<u32> = Vec::new();
+            tok.encode_with_added_tokens_flat(text.as_bytes(), &mut got);
+            assert_eq!(got, want, "ids differ from HF tokenizers on {text:?}");
+        }
+    }
+
     /// Corpus for the two-level differential: prose the artifact's superword
     /// merges actually fire on, plus the whitespace shapes whose stage-1
     /// junctions are the one hazard `Level1Units` has to glue (a plain
@@ -2198,6 +2238,7 @@ mod tests {
             PretokenizerType::Nemotron,
             PretokenizerType::Kimi,
             PretokenizerType::SuperBPEStage1,
+            PretokenizerType::SuperwordBounded,
         ];
         let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();
 
