@@ -2,10 +2,13 @@
 //! two-phase fill.
 //!
 //! A level-1 unit is a stage-1 pretoken extended over every following
-//! pretoken that *glues* onto it. [`glues`] is the whole rule set;
-//! `bpe::superword` derives it and documents what each clause costs when it
-//! is missing, since a hazard the rules do not cover lowers the derived
-//! threshold rather than changing anyone's tokens.
+//! pretoken that *glues* onto it. [`glues`] is the whole rule set — both of
+//! them: a narrow set every plan uses and two further rules a plan opts into
+//! (`wide`) only when its vocabulary needs them, because they coarsen units and
+//! cost level-1 cache hits. `bpe::superword` derives which set applies and
+//! documents what each clause costs when it is missing, since a hazard the
+//! rules do not cover lowers the derived threshold rather than changing
+//! anyone's tokens.
 //!
 //! Two walkers produce those units, and they must agree byte for byte:
 //!
@@ -69,7 +72,7 @@
 //! input ends, and every refill iteration must advance `pending`.
 
 use super::mask::{MaskScheme, MaskState};
-use super::{is_ascii_ws, is_digit};
+use super::{is_ascii_ws, is_digit, is_letter};
 use crate::pretokenize::{Pretoken, PretokenizerType, SpanBatch};
 use std::marker::PhantomData;
 
@@ -78,14 +81,89 @@ use std::marker::PhantomData;
 // -----------------------------------------------------------------------
 
 /// Whether `next` glues onto the stage-1 pretoken `prev` that precedes it —
-/// the four junction shapes a sub-threshold merge can span.
+/// the junction shapes a sub-threshold merge can span.
 /// `bpe::superword` documents each one and the merge IDs it otherwise costs.
+///
+/// Under `wide`, the survivors are the two junction shapes a real superword
+/// needs —
+/// `" of" | " the"` (word, then space) and `" don" | "'t"` (word, then
+/// punctuation) — so every prose word boundary is still a split point and the
+/// level-1 cache still sees ordinary words.
+///
+/// `wide` selects the two rules a vocabulary only needs if a low merge
+/// actually sits on one of their junctions, because both make units coarser
+/// and coarser units cost level-1 cache hits. On the committed 50k artifact —
+/// whose threshold is already its transition point without them — enabling
+/// them measured **147.9 vs 163.9 MB/s** (−9.8%, `bench_superword_variants`
+/// twophase+cuts, min of 5 over 33.5 MB of OWT), the cost of collapsing
+/// `well-known`, `don't` and `(word` into single units under GPT2's
+/// ` ?\p{L}+`. So `derive_threshold` treats the rule set as part of the plan
+/// it derives: it probes both and keeps `wide` only when the threshold it buys
+/// is strictly larger. The released 128k selects it and lands at 85956; the 50k
+/// artifact reaches 40000 either way, stays narrow, and re-measured at
+/// 163.5 MB/s once selection was in place. (485 → 13471 is what `wide` alone
+/// bought the release, before [`non_ascii_pair`] took it the rest of the way, so
+/// 485 is a pre-`non_ascii_pair` figure and not today's narrow probe.)
+///
+/// The last unconditional rule, [`non_ascii_pair`], is documented on its own
+/// below: it is what keeps *fragment* merges from capping either checkpoint
+/// (13471 and 24013 respectively) and is not part of this selection, because a
+/// vocabulary that needs it needs it for correctness.
+///
+/// `wide` is a parameter rather than a const generic because
+/// `bpe::superword::Level1Units` walks a *runtime* scheme and cannot
+/// monomorphize on it. Everything on the fill path can: this function is
+/// `#[inline(always)]` and those callers pass [`MaskScheme::LEVEL1_WIDE_GLUE`],
+/// a per-monomorphization constant, so the branch folds and the narrow rule
+/// set compiles to exactly what it was before `wide` existed.
 #[inline(always)]
-pub(crate) fn glues(prev: &[u8], next: &[u8]) -> bool {
+pub(crate) fn glues(prev: &[u8], next: &[u8], wide: bool) -> bool {
+    if wide && (starts_with_word(next) || (starts_with_whitespace(next) && ends_with_mark(prev))) {
+        return true;
+    }
     (ends_with_whitespace(prev) && starts_with_whitespace(next))
         || prev.last() == Some(&b'\'')
         || prev.first() == Some(&b'\'')
         || next.first().is_some_and(|&b| is_digit(b))
+        || non_ascii_pair(prev, next)
+}
+
+/// Whether the characters on *both* sides of the junction are non-ASCII.
+///
+/// A byte `>= 0x80` at a pretoken's end is either a lead byte or a
+/// continuation byte, and in both cases the character it belongs to is
+/// multi-byte; likewise at a pretoken's start. So two comparisons decide the
+/// question exactly, with no decode — this is the cheapest rule here.
+///
+/// It is the rule that makes *fragment* merges tractable. Byte-level BPE learns
+/// merges whose operands are pieces of characters, and for those the character
+/// at the junction is not in the merge at all — only its first byte or two are.
+/// The released 128k's merge 13471 is `"ا"` + `b"\xd8"`: that lead byte reaches
+/// U+0600–U+063F, which holds Arabic *letters* and ARABIC COMMA U+060C alike,
+/// so `bpe::superword::derive_threshold` cannot know which class follows and
+/// has to assume the splitting one. Without this rule the released 128k caps at
+/// **13471** and the committed 50k artifact at **24013**, both far below their
+/// transition points — and before this rule existed `derive_threshold` skipped
+/// those junctions instead, which is what made the released 128k encode
+/// `"ا،"` as `[5438, 48629]` where HuggingFace gives `[13471, 221]`.
+///
+/// Unconditional rather than part of `wide`, because every byte-level
+/// vocabulary trained on multilingual text has fragment merges, and because it
+/// is the one rule whose cost is bounded by the corpus rather than the
+/// tokenizer: it can only fire between two non-ASCII characters, which English
+/// prose does not contain.
+///
+/// Cost on the committed artifact, which needs it for correctness but never
+/// fires it on this corpus: `bench_superword_variants` twophase+cuts read
+/// **155.3 MB/s** against 163.5 before, min of 5 over the same 33.5 MB of OWT.
+/// That −5.0% is not the rule. Every one of the bench's six arms moved by the
+/// same amount, and `bench_released_128k_vs_plain`'s *plain* arm — which never
+/// calls this function, having no level 1 — read 31.6 against 33.4 in the same
+/// session, −5.4%. The two byte comparisons are below what this box resolves
+/// between sessions.
+#[inline(always)]
+pub(crate) fn non_ascii_pair(prev: &[u8], next: &[u8]) -> bool {
+    matches!((prev.last(), next.first()), (Some(&p), Some(&n)) if p >= 0x80 && n >= 0x80)
 }
 
 /// Decode the last character of `s` and report whether it is whitespace.
@@ -144,6 +222,137 @@ fn starts_with_whitespace_decode(s: &[u8]) -> bool {
     true
 }
 
+/// Decode the first character of `s` and report whether it is `\p{L}` or
+/// `\p{N}` — a *word* character, in the sense the stage-1 regexes use.
+///
+/// This is the predicate behind [`glues`]'s first clause. Every stage-1
+/// alternative that can begin a pretoken with a word character starts a fresh
+/// run at that character, so a merge whose right operand begins with one is
+/// reachable inside a single stage-1 pretoken too, and is a stage-1 merge
+/// rather than a superword. On the released 128k it is the `’|s`, `-|s`,
+/// `.|S`, `’|re` class that otherwise pins the threshold at 485.
+///
+/// `\p{M}` is `CharClass::Other`, so a leading combining mark is not a word
+/// character here. That is the conservative reading: marks ride inside stage-1
+/// letter runs, but a pretoken *beginning* with one came from a mark-initial
+/// run that the letter alternatives reach through their uppercase class, and
+/// treating it as a word character would claim more than the argument above.
+///
+/// An undecodable head counts as a word character, which only makes the
+/// walkers glue more — the safe direction, since gluing only removes split
+/// points and removing all of them is the plain path.
+#[inline(always)]
+pub(crate) fn starts_with_word(s: &[u8]) -> bool {
+    match s.first() {
+        Some(&b) if b < 0x80 => return is_letter(b) || is_digit(b),
+        None => return true,
+        Some(_) => {}
+    }
+    starts_with_word_decode(s)
+}
+
+/// [`starts_with_word`]'s multi-byte head, out of line for the same reason as
+/// [`ends_with_whitespace_decode`].
+#[inline(never)]
+fn starts_with_word_decode(s: &[u8]) -> bool {
+    use crate::pretokenize::unicode::{CharClass, class_of};
+    for k in 1..=4.min(s.len()) {
+        if let Ok(head) = std::str::from_utf8(&s[..k]) {
+            return head.chars().next().is_some_and(|c| {
+                matches!(class_of(c as u32), CharClass::Letter | CharClass::Number)
+            });
+        }
+    }
+    true
+}
+
+/// Whether the last character of `s` is `\p{M}` — [`glues`]'s second clause.
+///
+/// The punctuation alternative swallows a `[\r\n/]*` tail, so a pretoken
+/// ending in punctuation has already absorbed any newline after it and the
+/// junction does not exist. A combining mark is the one non-word, non-
+/// whitespace tail that does not: the o200k family routes `\p{M}` through the
+/// *letter* alternatives, which have no such tail, so `"\u{fe0f}" | "\n"` is a
+/// real boundary — and merge 91476 of the released 128k sits on it.
+///
+/// No ASCII codepoint is a combining mark, so the fast lane is a single
+/// comparison that ends the call — the reason this clause is free in prose.
+/// The decode is two table loads rather than a `\p{M}` set: a mark is exactly a
+/// codepoint the marks-joining classifier calls a letter and the plain one does
+/// not (`CharClass` has no `Mark` variant).
+///
+/// An undecodable tail is not a mark. That glues *less*, the direction that can
+/// only lower the derived threshold, never change anyone's tokens.
+#[inline(always)]
+pub(crate) fn ends_with_mark(s: &[u8]) -> bool {
+    match s.last() {
+        Some(&b) if b < 0x80 => return false,
+        None => return false,
+        Some(_) => {}
+    }
+    ends_with_mark_decode(s)
+}
+
+/// [`ends_with_mark`]'s multi-byte tail; see [`starts_with_word_decode`].
+#[inline(never)]
+fn ends_with_mark_decode(s: &[u8]) -> bool {
+    use crate::pretokenize::unicode::{CharClass, class_of, class_of_marks_join};
+    for k in 1..=4.min(s.len()) {
+        if let Ok(tail) = std::str::from_utf8(&s[s.len() - k..]) {
+            return tail.chars().next_back().is_some_and(|c| {
+                class_of_marks_join(c as u32) == CharClass::Letter
+                    && class_of(c as u32) != CharClass::Letter
+            });
+        }
+    }
+    false
+}
+
+// -----------------------------------------------------------------------
+// The rule-set wrapper
+// -----------------------------------------------------------------------
+
+/// `S`'s pretokenization with [`glues`]'s wide rule set — the same scanner,
+/// the same partition, coarser level-1 units.
+///
+/// A wrapper type rather than a const parameter on [`Level1Fill`] because the
+/// flag has to reach [`glue_filter`], which the fill calls through
+/// `MaskState::fill_spans_two_phase`; routing it as an associated const of the
+/// scheme keeps every signature in `mask.rs` untouched and still folds, since
+/// the fill is already monomorphic in `S`.
+///
+/// Uninhabited: it names a monomorphization, and no value of it is ever built.
+pub(crate) enum WideGlue<S: MaskScheme> {
+    #[allow(dead_code)]
+    Never(std::convert::Infallible, PhantomData<fn() -> S>),
+}
+
+// Pure delegation — only `LEVEL1_WIDE_GLUE` differs, so the two
+// instantiations partition input identically and `level1_walkers_agree_*`
+// covers both rule sets over the same scanner.
+impl<S: MaskScheme> MaskScheme for WideGlue<S> {
+    const LEVEL1_WIDE_GLUE: bool = true;
+
+    #[inline(always)]
+    fn advance(bytes: &[u8], pos: usize) -> usize {
+        S::advance(bytes, pos)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
+        S::batch_masks(bytes, scan)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn batch_masks_x86<const AVX512: bool>(bytes: &[u8], scan: usize) -> (u64, u64) {
+        // SAFETY: the tier requirement is `S`'s, forwarded unchanged — the
+        // caller has already runtime-detected it.
+        unsafe { S::batch_masks_x86::<AVX512>(bytes, scan) }
+    }
+}
+
 // -----------------------------------------------------------------------
 // The scalar walker
 // -----------------------------------------------------------------------
@@ -192,7 +401,11 @@ impl<S: MaskScheme> Level1Walk<S> {
         let mut prev_start = start;
         while let Some((next_start, next_end)) = self.state.next_span::<S>(bytes) {
             debug_assert_eq!(next_start, end, "pretokens are consecutive");
-            if !glues(&bytes[prev_start..end], &bytes[next_start..next_end]) {
+            if !glues(
+                &bytes[prev_start..end],
+                &bytes[next_start..next_end],
+                S::LEVEL1_WIDE_GLUE,
+            ) {
                 self.pending = Some((next_start, next_end));
                 break;
             }
@@ -228,7 +441,7 @@ impl<S: MaskScheme> Level1Walk<S> {
 /// `buf[0..nb]` must be initialised, strictly ascending, and every entry
 /// must be a pretoken end satisfying `fill_base + buf[i] <= bytes.len()`.
 #[inline(always)]
-pub(crate) unsafe fn glue_filter(
+pub(crate) unsafe fn glue_filter<S: MaskScheme>(
     bytes: &[u8],
     fill_base: usize,
     buf: *mut u16,
@@ -249,7 +462,7 @@ pub(crate) unsafe fn glue_filter(
         // so prev <= end <= next_end and fill_base + next_end <= len.
         let left = unsafe { bytes.get_unchecked(fill_base + prev..fill_base + end) };
         let right = unsafe { bytes.get_unchecked(fill_base + end..fill_base + next_end) };
-        let keep = !glues(left, right);
+        let keep = !glues(left, right, S::LEVEL1_WIDE_GLUE);
         // SAFETY: w <= i < nb, inside the initialised prefix.
         unsafe { buf.add(w).write(end as u16) };
         w += keep as usize;
@@ -348,30 +561,41 @@ unsafe impl<'a, S: MaskScheme> crate::pretokenize::PretokenSpans<'a> for Level1F
 /// `superword_encode_segment` rather than being represented here.
 pub(crate) enum Level1Spans<'a> {
     SuperBPEStage1(Level1Fill<'a, super::superbpe_stage1::SuperBPEStage1Scheme>),
+    SuperBPEStage1Wide(Level1Fill<'a, WideGlue<super::superbpe_stage1::SuperBPEStage1Scheme>>),
     Gpt2(Level1Fill<'a, super::r50k::R50kScheme>),
+    Gpt2Wide(Level1Fill<'a, WideGlue<super::r50k::R50kScheme>>),
 }
 
 impl<'a> Level1Spans<'a> {
-    /// `None` when `scheme` has no two-phase instantiation here.
+    /// `None` when `scheme` has no two-phase instantiation here. `wide` is the
+    /// plan's rule set ([`glues`]); it must be the one `derive_threshold`
+    /// probed, or the threshold would describe splitting the encode does not
+    /// perform.
     #[inline]
-    pub(crate) fn new(bytes: &'a [u8], scheme: PretokenizerType) -> Option<Self> {
-        match scheme {
-            PretokenizerType::SuperBPEStage1 => {
+    pub(crate) fn new(bytes: &'a [u8], scheme: PretokenizerType, wide: bool) -> Option<Self> {
+        match (scheme, wide) {
+            (PretokenizerType::SuperBPEStage1, false) => {
                 Some(Level1Spans::SuperBPEStage1(Level1Fill::new(bytes)))
             }
-            PretokenizerType::GPT2 => Some(Level1Spans::Gpt2(Level1Fill::new(bytes))),
+            (PretokenizerType::SuperBPEStage1, true) => {
+                Some(Level1Spans::SuperBPEStage1Wide(Level1Fill::new(bytes)))
+            }
+            (PretokenizerType::GPT2, false) => Some(Level1Spans::Gpt2(Level1Fill::new(bytes))),
+            (PretokenizerType::GPT2, true) => Some(Level1Spans::Gpt2Wide(Level1Fill::new(bytes))),
             _ => None,
         }
     }
 }
 
-// SAFETY: both arms are `Level1Fill`, whose impl upholds the contract.
+// SAFETY: every arm is a `Level1Fill`, whose impl upholds the contract.
 unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for Level1Spans<'a> {
     #[inline]
     fn fill_spans_keyed(&mut self, batch: &mut SpanBatch<'a>, prefetch: &impl Fn(u64)) -> usize {
         match self {
             Level1Spans::SuperBPEStage1(f) => f.fill_spans_keyed(batch, prefetch),
+            Level1Spans::SuperBPEStage1Wide(f) => f.fill_spans_keyed(batch, prefetch),
             Level1Spans::Gpt2(f) => f.fill_spans_keyed(batch, prefetch),
+            Level1Spans::Gpt2Wide(f) => f.fill_spans_keyed(batch, prefetch),
         }
     }
 }
@@ -382,9 +606,102 @@ mod tests {
     use crate::bpe::superword::Level1Units;
     use crate::pretokenize::{PRETOKEN_CHUNK, PretokenSpans};
 
-    /// Both schemes `SuperwordPlan::build` can pick.
-    const SCHEMES: [PretokenizerType; 2] =
-        [PretokenizerType::SuperBPEStage1, PretokenizerType::GPT2];
+    /// Every plan `SuperwordPlan::build` can pick: both candidate schemes
+    /// crossed with both glue rule sets, which is exactly [`Level1Spans`]'s
+    /// four arms. The differential tests run all four, because `wide` changes
+    /// where units end and each rule set is a live configuration — the released
+    /// 128k selects `true`, the committed 50k artifact `false`.
+    const SCHEMES: [(PretokenizerType, bool); 4] = [
+        (PretokenizerType::SuperBPEStage1, false),
+        (PretokenizerType::SuperBPEStage1, true),
+        (PretokenizerType::GPT2, false),
+        (PretokenizerType::GPT2, true),
+    ];
+
+    /// The junction shapes [`glues`] exists to decide, each one a threshold
+    /// that was measured on the released SuperBPE 128k rather than reasoned
+    /// about. The junctions that must *not* glue under either rule set are the
+    /// transition point itself and the merge just above it — glue either and
+    /// the derived threshold would sail past the real boundary between stage-1
+    /// merges and superwords, and two-level encoding would stop matching the
+    /// plain path.
+    ///
+    /// The `wide`-only cases are asserted from both sides. They have to glue
+    /// under `wide` or the released 128k stalls at 485, and they have to *not*
+    /// glue without it, because that difference is the whole reason
+    /// `derive_threshold` probes two rule sets instead of one: the 50k artifact
+    /// pays 9.8% for these two rules and buys nothing.
+    #[test]
+    fn glue_rules_decide_the_measured_junctions() {
+        // Word-initial right operand: a stage-1 pretoken can always start a
+        // fresh letter or digit run here, so these are stage-1 merges. Each
+        // one pinned the released 128k's threshold at the ID in its comment.
+        for (prev, next) in [
+            (&b" \xe2\x80\x99"[..], &b"s"[..]),  // " ’" | "s"   — 485
+            (&b" \xe2\x80\x99"[..], &b"re"[..]), // " ’" | "re"  — 1549
+            (&b" -"[..], &b"s"[..]),             // " -" | "s"   — 1269
+            (&b"."[..], &b"S"[..]),              // "."  | "S"   — 1920
+            (&b" Mc"[..], &b"C"[..]),            // camelCase, split by o200k
+        ] {
+            assert!(glues(prev, next, true), "{prev:?} | {next:?} must glue under wide");
+            assert!(!glues(prev, next, false), "{prev:?} | {next:?} is wide-only");
+        }
+
+        // Whitespace-initial right operand, after a combining mark: `️`
+        // reaches stage 1's letter alternative, which has no `[\r\n/]*` tail,
+        // so the newline lands in a pretoken of its own. That junction was the
+        // threshold at 91476, and it is why `ends_with_mark` exists.
+        assert!(glues(b"\xef\xb8\x8f", b"\n", true));
+        assert!(!glues(b"\xef\xb8\x8f", b"\n", false));
+
+        // Narrow rules, unchanged by `wide`: the `\p{N}{1,3}` rejoin, a
+        // whitespace run split by the fill, and either side of an apostrophe.
+        for (prev, next) in [
+            (&b"202"[..], &b"4"[..]),
+            (&b"  "[..], &b" \n"[..]),
+            (&b"don'"[..], &b"t"[..]),
+            (&b"'t"[..], &b" x"[..]),
+        ] {
+            assert!(glues(prev, next, false), "{prev:?} | {next:?} must glue");
+            assert!(glues(prev, next, true), "{prev:?} | {next:?} must glue under wide");
+        }
+
+        // Whitespace after *punctuation* does not glue, under either rule set.
+        // The punctuation alternative already swallowed any `[\r\n/]` tail, and
+        // a merge spanning punctuation and a following space would have an
+        // interior space — a superword by the release's own construction, so
+        // above the threshold either way. Gluing here is what cost 12.6%
+        // before `ends_with_mark` narrowed the clause (see `glues`).
+        //
+        // Below it, the survivors that make the rules sound: a real superword
+        // needs a word character on the left, and both of the released 128k's
+        // first two superwords have one.
+        for (prev, next) in [
+            (&b" !"[..], &b" x"[..]),
+            (&b" of"[..], &b" the"[..]), // the release's first true superword, 100164
+            (&b" don"[..], &b"'t"[..]),  // 100195
+            (&b"4"[..], &b" the"[..]),
+        ] {
+            assert!(!glues(prev, next, false), "{prev:?} | {next:?} must not glue");
+            assert!(!glues(prev, next, true), "{prev:?} | {next:?} must not glue under wide");
+        }
+
+        // The non-ASCII rule, unconditional and decided by one byte per side.
+        for (prev, next) in [
+            (&b"\xd8\xa7"[..], &b"\xd8\x8c"[..]), // "ا" | "،" — merge 13471's junction
+            (&b" \xd9\x86"[..], &b"\xd9\x8e"[..]), // Arabic letter, then fatha
+            (&b"\xb4"[..], &b"\xeb\xa6\xac"[..]), // a *fragment* left side still ends non-ASCII
+        ] {
+            assert!(non_ascii_pair(prev, next), "{prev:?} | {next:?} is a non-ASCII pair");
+            assert!(glues(prev, next, false), "{prev:?} | {next:?} must glue");
+            assert!(glues(prev, next, true), "{prev:?} | {next:?} must glue under wide");
+        }
+        // One ASCII side is enough to fall through to the other rules, which is
+        // what keeps English prose split at every word boundary.
+        for (prev, next) in [(&b" of"[..], &b"\xd8\x8c"[..]), (&b"\xd8\xa7"[..], &b","[..])] {
+            assert!(!non_ascii_pair(prev, next), "{prev:?} | {next:?} is not a non-ASCII pair");
+        }
+    }
 
     /// xorshift64: deterministic, dependency-free RNG for test inputs.
     struct XorShift64(u64);
@@ -399,8 +716,8 @@ mod tests {
     }
 
     /// Unit lengths from the chunked fill — the path under test.
-    fn fill_lens(bytes: &[u8], scheme: PretokenizerType) -> Vec<usize> {
-        fill_lens_counts(bytes, scheme).0
+    fn fill_lens(bytes: &[u8], scheme: PretokenizerType, wide: bool) -> Vec<usize> {
+        fill_lens_counts(bytes, scheme, wide).0
     }
 
     /// [`fill_lens`] plus the per-fill span counts, so a divergence can be
@@ -412,8 +729,12 @@ mod tests {
     /// would be a more permissive consumer than any real one — and it is:
     /// it passed a version of this fill that returned short mid-input,
     /// which silently truncated every encode.
-    fn fill_lens_counts(bytes: &[u8], scheme: PretokenizerType) -> (Vec<usize>, Vec<usize>) {
-        let mut spans = Level1Spans::new(bytes, scheme).expect("candidate scheme");
+    fn fill_lens_counts(
+        bytes: &[u8],
+        scheme: PretokenizerType,
+        wide: bool,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let mut spans = Level1Spans::new(bytes, scheme, wide).expect("candidate scheme");
         let mut batch = SpanBatch::new();
         let mut lens = Vec::new();
         let mut counts = Vec::new();
@@ -442,12 +763,15 @@ mod tests {
     }
 
     /// Unit lengths from `Level1Units`, the runtime-enum reference walker.
-    fn reference_lens(bytes: &[u8], scheme: PretokenizerType) -> Vec<usize> {
-        Level1Units::new(bytes, scheme).map(|u| u.0.len()).collect()
+    fn reference_lens(bytes: &[u8], scheme: PretokenizerType, wide: bool) -> Vec<usize> {
+        Level1Units::new(bytes, scheme, wide).map(|u| u.0.len()).collect()
     }
 
     /// Unit lengths from [`Level1Walk`], the monomorphic one-at-a-time walk.
-    fn walk_lens(bytes: &[u8], scheme: PretokenizerType) -> Vec<usize> {
+    ///
+    /// `wide` selects [`WideGlue`], the same wrapper [`Level1Spans`] uses, so
+    /// the walk and the fill read the rule set the same way.
+    fn walk_lens(bytes: &[u8], scheme: PretokenizerType, wide: bool) -> Vec<usize> {
         fn collect<S: MaskScheme>(bytes: &[u8]) -> Vec<usize> {
             let mut walk = Level1Walk::<S>::new(0);
             let mut lens = Vec::new();
@@ -461,11 +785,13 @@ mod tests {
             assert_eq!(pos, bytes.len(), "units must cover the input");
             lens
         }
-        match scheme {
-            PretokenizerType::SuperBPEStage1 => {
-                collect::<super::super::superbpe_stage1::SuperBPEStage1Scheme>(bytes)
-            }
-            PretokenizerType::GPT2 => collect::<super::super::r50k::R50kScheme>(bytes),
+        type Stage1 = super::super::superbpe_stage1::SuperBPEStage1Scheme;
+        type Gpt2 = super::super::r50k::R50kScheme;
+        match (scheme, wide) {
+            (PretokenizerType::SuperBPEStage1, false) => collect::<Stage1>(bytes),
+            (PretokenizerType::SuperBPEStage1, true) => collect::<WideGlue<Stage1>>(bytes),
+            (PretokenizerType::GPT2, false) => collect::<Gpt2>(bytes),
+            (PretokenizerType::GPT2, true) => collect::<WideGlue<Gpt2>>(bytes),
             _ => unreachable!(),
         }
     }
@@ -534,12 +860,12 @@ mod tests {
     #[test]
     fn level1_walkers_agree_on_structural_cases() {
         for case in structural_cases() {
-            for scheme in SCHEMES {
-                let want = reference_lens(&case, scheme);
+            for (scheme, wide) in SCHEMES {
+                let want = reference_lens(&case, scheme, wide);
                 assert_eq!(
-                    walk_lens(&case, scheme),
+                    walk_lens(&case, scheme, wide),
                     want,
-                    "{scheme:?}: one-at-a-time walk diverged on {:?} (len {})",
+                    "{scheme:?}/wide={wide}: one-at-a-time walk diverged on {:?} (len {})",
                     String::from_utf8_lossy(&case[..case.len().min(80)]),
                     case.len(),
                 );
@@ -549,14 +875,14 @@ mod tests {
                 // boundary or inside one separates a chunk-carry bug from a
                 // glue-rule bug, and it is invisible in a diff of two
                 // thousand-element length vectors.
-                let (got, counts) = fill_lens_counts(&case, scheme);
+                let (got, counts) = fill_lens_counts(&case, scheme, wide);
                 if got != want {
                     let k = (0..got.len().min(want.len()))
                         .find(|&k| got[k] != want[k])
                         .unwrap_or(got.len().min(want.len()));
                     let off: usize = want[..k].iter().sum();
                     panic!(
-                        "{scheme:?}: two-phase fill diverged on {:?} (len {})\n  \
+                        "{scheme:?}/wide={wide}: two-phase fill diverged on {:?} (len {})\n  \
                          first differing unit #{k} at byte {off}: got {:?}, want {:?}\n  \
                          context {:?}\n  got  {:?}\n  want {:?}\n  per-fill counts {:?}",
                         String::from_utf8_lossy(&case[..case.len().min(60)]),
@@ -607,18 +933,18 @@ mod tests {
             buf.truncate(len);
             // Exactly-sized allocation, so an overrun is a real OOB.
             let exact: Box<[u8]> = buf.into_boxed_slice();
-            for scheme in SCHEMES {
-                let want = reference_lens(&exact, scheme);
+            for (scheme, wide) in SCHEMES {
+                let want = reference_lens(&exact, scheme, wide);
                 assert_eq!(
-                    walk_lens(&exact, scheme),
+                    walk_lens(&exact, scheme, wide),
                     want,
-                    "{scheme:?}: one-at-a-time walk diverged on {:?}",
+                    "{scheme:?}/wide={wide}: one-at-a-time walk diverged on {:?}",
                     exact
                 );
                 assert_eq!(
-                    fill_lens(&exact, scheme),
+                    fill_lens(&exact, scheme, wide),
                     want,
-                    "{scheme:?}: two-phase fill diverged on {:?}",
+                    "{scheme:?}/wide={wide}: two-phase fill diverged on {:?}",
                     exact
                 );
             }

@@ -22,6 +22,7 @@ pub mod qwen3_5;
 pub mod r50k;
 pub mod superbpe_stage1;
 pub mod superword;
+pub mod superword_bounded;
 
 pub use cl100k::FastCl100kPretokenizer;
 pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
@@ -34,6 +35,7 @@ pub use qwen3_5::FastQwen35Pretokenizer;
 pub use r50k::FastR50kPretokenizer;
 pub use superbpe_stage1::FastSuperBPEStage1Pretokenizer;
 pub use superword::FastSuperwordPretokenizer;
+pub use superword_bounded::FastSuperwordBoundedPretokenizer;
 
 use crate::pretokenize::SpanBatch;
 use crate::pretokenize::unicode;

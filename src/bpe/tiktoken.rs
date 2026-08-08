@@ -780,15 +780,29 @@ impl Tokenizer {
     /// like every mutation it must precede any `WorkerPool` fork).
     ///
     /// Declined for:
-    /// - schemes that already split (nothing to recover — the plain path
-    ///   *is* the level-1 path),
+    /// - schemes that split *inside* words (nothing to recover — the plain path
+    ///   *is* the level-1 path). [`PretokenizerType::Superword`] and
+    ///   [`PretokenizerType::SuperwordBounded`] are the two that do not, since
+    ///   both let a token span whitespace,
     /// - rank-mapped vocabularies, where merge priority is not the token ID
     ///   and so the stage-1/stage-2 prefix split does not hold,
     /// - `ignore_merges`, which lets a whole-pretoken vocab hit bypass the
     ///   merge loop and so is not reproducible from a merge prefix.
+    ///
+    /// `SuperwordBounded`'s outer scheme *does* split, and admitting it needs no
+    /// new soundness condition: [`Self::superword_encode_segment`] already loops
+    /// over the outer pretokens and runs level 2 within each one, exactly as the
+    /// plain path merges within each one. Level 1 therefore only ever splits
+    /// *inside* an outer pretoken, so the boundary set it adds is the one
+    /// `superword::derive_threshold` already probes — and the places where the
+    /// outer boundaries are not a refinement of stage 1's (2+ combining marks,
+    /// `"a \t b"`) cannot matter, because no merge crosses an outer boundary on
+    /// either path.
     pub fn enable_superword_two_level(&mut self) {
-        if !matches!(self.pretokenizer_type, PretokenizerType::Superword)
-            || self.ranked_merges.is_some()
+        if !matches!(
+            self.pretokenizer_type,
+            PretokenizerType::Superword | PretokenizerType::SuperwordBounded
+        ) || self.ranked_merges.is_some()
             || self.ignore_merges
         {
             return;
@@ -1190,6 +1204,7 @@ impl Tokenizer {
                 &mut plan.stage1,
                 plan.l1_fill,
                 plan.stage1_scheme,
+                plan.stage1_wide_glue,
                 unit.0,
                 &mut plan.symbols,
             );
@@ -1230,20 +1245,21 @@ impl Tokenizer {
         stage1: &mut Tokenizer,
         l1_fill: superword::L1Fill,
         scheme: PretokenizerType,
+        wide: bool,
         unit: &[u8],
         out: &mut Vec<u32>,
     ) {
         if l1_fill == superword::L1Fill::TwoPhase {
-            if let Some(spans) = Level1Spans::new(unit, scheme) {
+            if let Some(spans) = Level1Spans::new(unit, scheme, wide) {
                 stage1.memoized_encode_flat(spans, out);
                 return;
             }
         }
         if l1_fill == superword::L1Fill::Buf {
-            stage1.memoized_encode_flat(Level1Units::new(unit, scheme), out);
+            stage1.memoized_encode_flat(Level1Units::new(unit, scheme, wide), out);
             return;
         }
-        stage1.memoized_encode_flat(SpanIter(Level1Units::new(unit, scheme)), out);
+        stage1.memoized_encode_flat(SpanIter(Level1Units::new(unit, scheme, wide)), out);
     }
 
     /// Level 2 of [`Self::superword_encode_segment`]: merge `plan.symbols` in
@@ -1312,6 +1328,7 @@ impl Tokenizer {
                 &mut plan.stage1,
                 plan.l1_fill,
                 plan.stage1_scheme,
+                plan.stage1_wide_glue,
                 unit.0,
                 out,
             );
@@ -1797,6 +1814,23 @@ mod test_util {
         }
     }
 
+    /// The tokenizer released with the SuperBPE paper. Its `pre_tokenizer` is
+    /// `Sequence[Split(<the bounded regex>, Isolated), ByteLevel(use_regex=false)]`,
+    /// which `from_split_regex` maps to `SuperwordBounded`; before that arm
+    /// existed the load failed outright with "Unknown pre_tokenizer Split
+    /// regexes".
+    pub(super) const RELEASED_128K_REPO: &str = "alisawuffles/superbpe-tokenizer-128k";
+
+    /// [`RELEASED_128K_REPO`]'s `tokenizer.json` out of the local HF cache, or
+    /// `None` after printing the skip line. Rust tests here never download.
+    pub(super) fn released_128k_path() -> Option<std::path::PathBuf> {
+        let path = crate::test_hub::hf_tokenizer_json(RELEASED_128K_REPO);
+        if path.is_none() {
+            eprintln!("Skipping: {RELEASED_128K_REPO} tokenizer.json not in the HF cache");
+        }
+        path
+    }
+
     /// xorshift64: deterministic, dependency-free RNG for test inputs.
     pub(super) struct XorShift64(pub u64);
 
@@ -1937,6 +1971,121 @@ mod tests {
     /// superword token ID is exactly 40000.
     const SUPERBPE_ARTIFACT: &str = "benchmarks/superbpe/artifacts/supergigatoken.json";
 
+    /// The released 128k must load, pick the new scheme, and reproduce HF
+    /// `tokenizers`' ids. The expected ids are HF ground truth measured on
+    /// this tokenizer.json, not this implementation's output.
+    #[test]
+    fn released_128k_loads_with_superword_bounded() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::released_128k_path() else { return };
+        let mut tok = load_hf_bpe(&path).expect("the released 128k must load");
+        assert_eq!(tok.pretokenizer_type, PretokenizerType::SuperwordBounded);
+        // 128000 model entries plus the one added token `<|endoftext|>` at id
+        // 128000, so the vocab table runs to 128001 slots.
+        assert_eq!(tok.vocab_size(), 128_001);
+        assert_eq!(tok.added_tokens.len(), 1);
+
+        // `"hi! there"` staying one pretoken is the scheme's defining
+        // property (a lone `!` fails `{2,}`), so these ids also witness that
+        // the outer split is the bounded one and not stage 1's.
+        for (text, want) in [
+            ("hi! there The quick brown fox", &[6292, 0, 530, 359, 1833, 5962, 18062][..]),
+            (
+                "camelCase McDonald and 12345 items",
+                &[66, 14552, 17446, 106605, 100319, 11066, 3099, 3675][..],
+            ),
+        ] {
+            let mut got: Vec<u32> = Vec::new();
+            tok.encode_with_added_tokens_flat(text.as_bytes(), &mut got);
+            assert_eq!(got, want, "ids differ from HF tokenizers on {text:?}");
+        }
+    }
+
+    /// The released 128k's transition point, derived from merge order: the
+    /// first merge whose result contains a space at a non-leading position —
+    /// the first genuine cross-whitespace superword — is `ĠofĠthe`, token id
+    /// 100164 (merge index 99921). Exactly four sub-100k merges look
+    /// space-spanning and all are whitespace-only, which stage 1's `\s+`
+    /// produces as single pretokens: `ÂłĠ` (NBSP+space, 12215), `ÂłÂłĠ`
+    /// (17763), `ĉĠ` (tab+space, 38730), `ĉĉĠ` (98405). So the release is
+    /// t=100k on a 128k vocab.
+    ///
+    /// Reaching it needs the word-initial glue rule (`level1::glues`). With
+    /// only the whitespace/apostrophe/digit rules the threshold is **485**,
+    /// pinned by `"’" | "s"`: stage 1's punctuation alternative is
+    /// ` ?[^\s\p{L}\p{N}]+`, so `" ’s"` splits into `" ’"` and `"s"`, and the
+    /// class continues `’|t` 682, `-|s` 1269, `’|re` 1549, `.|S` 1920. At 485
+    /// level 1 applies almost no merges and two-level encoding is *slower*
+    /// than the plain path it exists to beat.
+    const RELEASED_128K_TRANSITION: u32 = 100_164;
+
+    /// What `derive_threshold` actually reaches on the release: **85956**, or
+    /// 85.8% of the way to the transition point above.
+    ///
+    /// The gap is not slack in the probe — it is one merge that genuinely sits
+    /// on a level-1 boundary below the transition. 85956 is `b"\x8a"` + `b"\n"`:
+    /// a *lone continuation byte*, the tail of some multi-byte character, joined
+    /// to a newline. Byte-level BPE builds characters up from fragments, so such
+    /// a token exists, and the character it ends can be a letter — `b"\x8a"`
+    /// completes to り (`b"\xe3\x82\x8a"`) among many others. Letter-then-newline
+    /// is a stage-1 boundary under both candidate schemes, so level 1 splits
+    /// exactly where this merge would have to fire.
+    ///
+    /// That makes 100164 the release's *semantic* transition (the first merge
+    /// that spans whitespace by intent) but not a safe threshold: the bound has
+    /// to hold for every merge below it, including the fragment ones nobody
+    /// designed. Encoding this checkpoint against HF is what surfaced it —
+    /// admitting a fragment junction as safe cost 5 tokens in 16,007,082 on the
+    /// OWT eval slice, all in one Arabic document.
+    const RELEASED_128K_THRESHOLD: u32 = 85_956;
+
+    /// `derive_threshold` must reach [`RELEASED_128K_THRESHOLD`] on the real
+    /// released vocabulary — the gate on the whole two-level premise for this
+    /// tokenizer. It is close enough to [`RELEASED_128K_TRANSITION`] that level
+    /// 1 carries essentially the whole stage-1 table; the constant's docs
+    /// explain the one merge in between.
+    ///
+    /// Built directly rather than read off `superword_threshold()`: this
+    /// measures `derive_threshold`, and whether `enable_superword_two_level`
+    /// admits the scheme is a separate decision made after this one.
+    #[test]
+    fn released_128k_threshold_reaches_transition_point() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::released_128k_path() else { return };
+        let tok = load_hf_bpe(&path).expect("the released 128k must load");
+        let threshold = superword::SuperwordPlan::build(
+            &tok.vocab,
+            &tok.vocab_inv,
+            &tok.merges,
+            tok.byte_remapping.as_ref(),
+        )
+        .map(|plan| plan.threshold);
+        assert_eq!(threshold, Some(RELEASED_128K_THRESHOLD));
+        assert!(RELEASED_128K_THRESHOLD < RELEASED_128K_TRANSITION);
+    }
+
+    /// The `Junction::OpenLeft` arm caps the release at
+    /// [`RELEASED_128K_THRESHOLD`] by *assuming* the worst about a merge whose
+    /// left operand opens inside a character. This checks the assumption is not
+    /// merely conservative but exact: complete that operand and the boundary is
+    /// really there, so enumerating left completions — the mirror of
+    /// `open_right_can_split` — would buy nothing.
+    ///
+    /// Merge 85956 is `b"\x8a"` + `b"\n"`; `b"\xe3\x82\x8a"` is り. If a future
+    /// glue rule ever makes letter-then-newline safe, this fails and the arm is
+    /// worth replacing with enumeration.
+    #[test]
+    fn open_left_cap_is_a_real_boundary() {
+        for scheme in [PretokenizerType::SuperBPEStage1, PretokenizerType::GPT2] {
+            for wide in [false, true] {
+                assert!(
+                    superword::junction_can_split_for_test(b"\xe3\x82\x8a", b"\n", scheme, wide),
+                    "letter|newline must be a level-1 boundary for {scheme:?} (wide={wide})"
+                );
+            }
+        }
+    }
+
     /// Corpus for the two-level differential: prose the artifact's superword
     /// merges actually fire on, plus the whitespace shapes whose stage-1
     /// junctions are the one hazard `Level1Units` has to glue (a plain
@@ -1958,6 +2107,21 @@ mod tests {
         "caf\u{e9} na\u{ef}ve \u{fc}ber \u{e9}l\u{e8}ve",
         "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{ff0c}\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}",
         "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} \u{92e}\u{947}\u{902} \u{932}\u{93f}\u{916}\u{93e}",
+        // The fragment-junction hazard, and the only case in this corpus that
+        // needs a *byte-level* rather than character-level argument. Merge 13471
+        // of the released 128k is (`"ا"`, `b"\xd8"`) — an Arabic letter plus the
+        // bare lead byte of the next character. Its junction is a real boundary
+        // (the character it opens can be ARABIC COMMA, U+060C), but the merge
+        // carries no whole character on the right, so a junction test that asks
+        // "do both sides decode?" reads it as interior and admits it below the
+        // threshold. Level 1 then cannot apply it across the letter|comma split
+        // and encodes `"ا،"` as `[5438, 48629]` where HF gives `[13471, 221]`.
+        // Cost when it shipped: 5 tokens in 16,007,082, in one document out of
+        // 19,937 — which is why the pin is here and not left to the corpus test.
+        "\u{627}\u{60c}",
+        "\u{627}\u{60c} \u{647}\u{627}\u{60c} \u{644}\u{627}\u{60c}",
+        "\u{62d}\u{627}\u{644}\u{62a}\u{647}\u{627}\u{60c} \u{64a}\u{637}\u{644}\u{628}",
+        "\u{627}\u{61f} \u{627}\u{6d4} a\u{627}\u{60c}a",
         "word  ,  word ;; word -- word",
         "1  2   34    567  8901",
         // The contraction hazard: `("'", "s")` is a low-ID merge because
@@ -2043,6 +2207,89 @@ mod tests {
         use crate::load_tokenizer::hf::load_hf_bpe;
         use crate::bpe::superword::L1Fill;
         let mut tok = load_hf_bpe(repo_file(SUPERBPE_ARTIFACT)).expect("load SuperBPE artifact");
+        let long = SUPERWORD_CASES.join(" ").repeat(40);
+        for case in SUPERWORD_CASES.iter().copied().chain([long.as_str()]) {
+            let mut want: Vec<u32> = Vec::new();
+            tok.set_superword_variant(L1Fill::Iter, false);
+            tok.encode_with_added_tokens_flat(case.as_bytes(), &mut want);
+            for l1_fill in [L1Fill::Iter, L1Fill::Buf, L1Fill::TwoPhase] {
+                for use_cuts in [false, true] {
+                    let mut got: Vec<u32> = Vec::new();
+                    tok.set_superword_variant(l1_fill, use_cuts);
+                    tok.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+                    assert_eq!(
+                        got,
+                        want,
+                        "l1_fill={l1_fill:?} use_cuts={use_cuts} diverged on {:?}",
+                        &case[..case.len().min(120)],
+                    );
+                }
+            }
+        }
+    }
+
+    /// The released 128k must encode identically through the two-level path and
+    /// the plain whole-pretoken one — the same guarantee
+    /// [`superword_two_level_matches_single_pretoken`] makes for the committed
+    /// artifact, on the tokenizer whose outer scheme actually splits.
+    ///
+    /// That difference is the point. `superword_encode_segment` runs level 2 per
+    /// *outer* pretoken, so on this tokenizer level 1 receives bounded slices
+    /// rather than a whole segment, and unit placement at a slice edge is a
+    /// shape the artifact's tests never reach. Where the outer scheme's
+    /// boundaries are not stage 1's at all — a run of 2+ combining marks, or
+    /// `"a \t b"`, which the release cuts at offset 2 where stage 1 cuts at 1
+    /// and 3 — both paths merge within the same outer piece, so the plain path
+    /// is the authority on what that should produce.
+    ///
+    /// Reuses [`SUPERWORD_CASES`]: its whitespace, apostrophe, contraction-tail
+    /// and digit-run shapes are the junctions the glue rules cover, and the long
+    /// repeat crosses a `PRETOKEN_CHUNK` boundary in level 1.
+    #[test]
+    fn released_128k_two_level_matches_plain() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::released_128k_path() else { return };
+        let mut two_level = load_hf_bpe(&path).expect("the released 128k must load");
+        assert_eq!(
+            two_level.superword_threshold(),
+            Some(RELEASED_128K_THRESHOLD),
+            "the two-level plan must be installed at the derived threshold"
+        );
+        let mut plain = load_hf_bpe(&path).expect("the released 128k must load");
+        plain.disable_superword_two_level();
+        assert_eq!(plain.superword_threshold(), None);
+
+        let long = SUPERWORD_CASES.join(" ").repeat(40);
+        for case in SUPERWORD_CASES.iter().copied().chain([long.as_str()]) {
+            let mut got: Vec<u32> = Vec::new();
+            let mut want: Vec<u32> = Vec::new();
+            two_level.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+            plain.encode_with_added_tokens_flat(case.as_bytes(), &mut want);
+            assert_eq!(
+                got,
+                want,
+                "two-level diverged on {:?}",
+                &case[..case.len().min(120)],
+            );
+        }
+    }
+
+    /// [`superword_variants_agree`] on the released 128k. The level-1 fill runs
+    /// on bounded outer pretokens here rather than whole segments, which is a
+    /// different input distribution for the two-phase walker's refill and
+    /// rewind: short slices end a fill immediately, so the deferred last
+    /// boundary and the scalar one-unit fallback are hit far more often than on
+    /// the artifact.
+    #[test]
+    fn released_128k_variants_agree() {
+        use crate::bpe::superword::L1Fill;
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::released_128k_path() else { return };
+        let mut tok = load_hf_bpe(&path).expect("the released 128k must load");
+        assert!(
+            tok.superword_threshold().is_some(),
+            "no plan installed: every arm would be the plain path and agree vacuously"
+        );
         let long = SUPERWORD_CASES.join(" ").repeat(40);
         for case in SUPERWORD_CASES.iter().copied().chain([long.as_str()]) {
             let mut want: Vec<u32> = Vec::new();
@@ -2198,6 +2445,7 @@ mod tests {
             PretokenizerType::Nemotron,
             PretokenizerType::Kimi,
             PretokenizerType::SuperBPEStage1,
+            PretokenizerType::SuperwordBounded,
         ];
         let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();
 
@@ -2369,15 +2617,44 @@ mod verify_heavy {
     fn bench_superword_two_level_vs_plain() {
         let (input, mbytes, rounds) = superbpe_bench_corpus();
         let docs = split_docs(&input, b"<|endoftext|>");
-        let path = superbpe_artifact();
+        two_level_vs_plain(&superbpe_artifact(), &docs, mbytes, rounds);
+    }
 
-        let mut two_level = load_hf_bpe(&path).expect("load SuperBPE artifact");
-        assert!(
-            two_level.superword_threshold().is_some(),
-            "two-level plan must be installed, or this measures nothing"
-        );
-        let mut plain = load_hf_bpe(&path).expect("load SuperBPE artifact");
+    /// [`bench_superword_two_level_vs_plain`] on the tokenizer released with the
+    /// paper — the number the README quotes against HuggingFace `tokenizers`.
+    ///
+    /// A separate test rather than a parameter because of the two-residents rule
+    /// in the sibling's doc: each of these benches keeps two 128k-class
+    /// tokenizers alive, so exactly one may run per process, so each needs a
+    /// name no other bench's filter prefix selects.
+    ///
+    /// What differs from the artifact arm is where level 1 gets its input. Here
+    /// the outer scheme splits, so level 1 receives bounded pretokens — short
+    /// slices, one fill each, the two-phase walker's refill path barely
+    /// exercised — and the outer scalar scan is inside the measurement. The gap
+    /// between this ratio and the artifact's is that scan plus the shorter
+    /// level-2 runs; [`bench_released_128k_phases`] separates them.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bench_released_128k_vs_plain -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_released_128k_vs_plain() {
+        let Some(path) = super::test_util::released_128k_path() else { return };
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
+        let docs = split_docs(&input, b"<|endoftext|>");
+        two_level_vs_plain(&path, &docs, mbytes, rounds);
+    }
+
+    /// Shared body of the two-level-vs-plain benches: `path` loaded twice, the
+    /// second copy's plan removed, both arms run to completion in turn.
+    fn two_level_vs_plain(path: &std::path::Path, docs: &[&[u8]], mbytes: f64, rounds: usize) {
+        let mut two_level = load_hf_bpe(path).expect("load tokenizer");
+        let threshold = two_level.superword_threshold();
+        assert!(threshold.is_some(), "two-level plan must be installed, or this measures nothing");
+        let mut plain = load_hf_bpe(path).expect("load tokenizer");
         plain.disable_superword_two_level();
+        eprintln!("  {:?}, threshold {}", path.file_name().unwrap(), threshold.unwrap());
 
         let mut results = Vec::new();
         for (label, tok) in [("two-level", &mut two_level), ("plain", &mut plain)] {
@@ -2386,7 +2663,7 @@ mod verify_heavy {
             for round in 0..rounds {
                 let mut out: Vec<u32> = Vec::new();
                 let start = std::time::Instant::now();
-                for doc in &docs {
+                for doc in docs {
                     tok.encode_with_added_tokens_flat(doc, &mut out);
                 }
                 best = best.max(mbytes / start.elapsed().as_secs_f64());
@@ -2433,11 +2710,46 @@ mod verify_heavy {
     fn bench_superword_phase_split() {
         let (input, mbytes, rounds) = superbpe_bench_corpus();
         let docs = split_docs(&input, b"<|endoftext|>");
-        let mut tok = load_hf_bpe(&superbpe_artifact()).expect("load SuperBPE artifact");
+        phase_split(&superbpe_artifact(), &docs, mbytes, rounds);
+    }
+
+    /// [`bench_superword_phase_split`] on the released 128k, which is where the
+    /// decomposition earns its keep: this tokenizer's `level 1` arm also contains
+    /// the scalar `superword_bounded` outer scan, so `full − level 1` bounds what
+    /// a SIMD outer scanner could possibly recover. The scan is *inside* level 1
+    /// and cannot be subtracted out from here — what this bench decides is
+    /// whether the remaining level-1 cost is large enough for that to matter.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bench_released_128k_phases -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_released_128k_phases() {
+        let Some(path) = super::test_util::released_128k_path() else { return };
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
+        let docs = split_docs(&input, b"<|endoftext|>");
+        phase_split(&path, &docs, mbytes, rounds);
+    }
+
+    /// Shared body of the phase-split benches. One resident tokenizer, three
+    /// arms by subtraction.
+    fn phase_split(path: &std::path::Path, docs: &[&[u8]], mbytes: f64, rounds: usize) {
+        let mut tok = load_hf_bpe(path).expect("load tokenizer");
         assert!(tok.superword_threshold().is_some(), "no plan: nothing to decompose");
 
+        // The level-2 replay arm is only *faithful* when the outer scheme hands
+        // level 1 the whole segment. `superword_encode_segment` runs level 2 once
+        // per outer pretoken, so under `SuperwordBounded` replaying a document's
+        // concatenated level-1 stream in one call merges across boundaries the
+        // real path never crosses: it computes different tokens, not just a
+        // different time. Skipped there rather than repaired, because the repair
+        // (one retained `Vec` per outer pretoken, millions of them) would be
+        // further from the real memory layout than the arm it replaces.
+        // `full − level 1` is the authority in both cases anyway.
+        let replayable = tok.pretokenizer_type == PretokenizerType::Superword;
+
         let mut level1: Vec<Vec<u32>> = Vec::with_capacity(docs.len());
-        for doc in &docs {
+        for doc in docs {
             let mut stream = Vec::new();
             tok.superword_level1_only(doc, &mut stream);
             level1.push(stream);
@@ -2449,7 +2761,7 @@ mod verify_heavy {
         for round in 0..rounds {
             let mut out: Vec<u32> = Vec::new();
             let start = std::time::Instant::now();
-            for doc in &docs {
+            for doc in docs {
                 tok.encode_with_added_tokens_flat(doc, &mut out);
             }
             best_full = best_full.max(mbytes / start.elapsed().as_secs_f64());
@@ -2462,14 +2774,14 @@ mod verify_heavy {
         for _ in 0..rounds {
             let mut sink: Vec<u32> = Vec::new();
             let start = std::time::Instant::now();
-            for doc in &docs {
+            for doc in docs {
                 tok.superword_level1_only(doc, &mut sink);
             }
             best_l1 = best_l1.max(mbytes / start.elapsed().as_secs_f64());
         }
 
         let mut best_l2 = 0.0f64;
-        for _ in 0..rounds {
+        for _ in 0..if replayable { rounds } else { 0 } {
             let mut sink: Vec<u32> = Vec::new();
             let start = std::time::Instant::now();
             for stream in &level1 {
@@ -2479,9 +2791,34 @@ mod verify_heavy {
             assert_eq!(sink, full_out, "level-2 replay must reproduce the output");
         }
 
+        // The outer pretokenizer alone. It sits *inside* the `level 1` arm and is
+        // the one stage of this path with no SIMD scanner behind it
+        // (`superword_bounded` is a scalar walker), so `full / outer` is the share
+        // of end-to-end cost a vectorized outer scan would be competing for.
+        // Last, so `full` and `level 1` keep the positions they were measured in.
+        // The coverage assert doubles as the reason the walk cannot be optimized
+        // away: `Isolated` gap emission makes the scan a partition of the input.
+        let total_bytes: usize = docs.iter().map(|d| d.len()).sum();
+        let mut best_outer = 0.0f64;
+        for _ in 0..rounds {
+            let mut covered = 0usize;
+            let start = std::time::Instant::now();
+            for doc in docs {
+                for unit in tok.pretokenizer_type.pretokenize(doc) {
+                    covered += unit.0.len();
+                }
+            }
+            best_outer = best_outer.max(mbytes / start.elapsed().as_secs_f64());
+            assert_eq!(covered, total_bytes, "the outer scan must cover every byte");
+        }
+
         eprintln!("      full: {best_full:8.1} MB/s   ({mbytes:.1} MB, min of {rounds})");
         eprintln!("   level 1: {best_l1:8.1} MB/s   (fill + cached stage-1 encode)");
-        eprintln!("   level 2: {best_l2:8.1} MB/s   (merge alone, replayed)");
+        if replayable {
+            eprintln!("   level 2: {best_l2:8.1} MB/s   (merge alone, replayed)");
+        } else {
+            eprintln!("   level 2:      n/a       (replay crosses outer pretokens here)");
+        }
         // Serial phases compose as reciprocals, so the level-2 share the real
         // path pays is what is left of `full` once level 1 is subtracted.
         let derived = 1.0 / (1.0 / best_full - 1.0 / best_l1);
@@ -2490,6 +2827,12 @@ mod verify_heavy {
             "     split: level 1 {:.0}% / level 2 {:.0}% of the two-level cost",
             100.0 * best_full / best_l1,
             100.0 * best_full / derived,
+        );
+        eprintln!(
+            "     outer: {best_outer:8.1} MB/s   ({:.0}% of the two-level cost; \
+             removing it entirely would give {:.2}x)",
+            100.0 * best_full / best_outer,
+            1.0 / (1.0 - best_full / best_outer),
         );
     }
 

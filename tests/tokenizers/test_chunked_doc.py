@@ -32,7 +32,10 @@ def big_text() -> str:
 
 def test_whole_doc_parallel_matches_serial(gigatoken_tok, big_text, tmp_path):
     path = tmp_path / "doc.txt"
-    path.write_text(big_text)
+    # Bytes, not write_text: on Windows the latter both encodes with the
+    # locale codec (cp1252 cannot represent the corpus) and translates "\n"
+    # to "\r\n", so the file would not be the text `serial` is measured on.
+    path.write_bytes(big_text.encode("utf-8"))
     parallel = gigatoken_tok.encode_files([str(path)])  # whole file = one doc
     serial = gigatoken_tok.encode(big_text)
     assert len(parallel) == 1
@@ -53,12 +56,12 @@ def test_space_added_token_chunked_matches_serial(
     token_text = "<|multi word separator|>"
     token_id = 50257  # one past the GPT-2 vocab
 
-    spec = json.loads(gpt2_tokenizer_path.read_text())
+    spec = json.loads(gpt2_tokenizer_path.read_text(encoding="utf-8"))
     spec["added_tokens"].append(
         {"id": token_id, "content": token_text, "special": True}
     )
     path = tmp_path / "tokenizer.json"
-    path.write_text(json.dumps(spec, ensure_ascii=False))
+    path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     tok = BPETokenizer.from_hf(path)
 
     pieces = 64

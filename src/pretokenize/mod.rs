@@ -1000,6 +1000,14 @@ mod span_source_tests {
             crate::pretokenize::fast::FastSuperBPEStage1Pretokenizer::new(b),
             "superbpe_stage1",
         );
+        // Scalar, like deepseek_v3 above: this suite is about the
+        // fill/iterator agreement contract, which every scheme owes
+        // regardless of whether a SIMD scanner drives it.
+        check_source(
+            crate::pretokenize::fast::FastSuperwordBoundedPretokenizer::new(b),
+            crate::pretokenize::fast::FastSuperwordBoundedPretokenizer::new(b),
+            "superword_bounded",
+        );
     }
 
     /// Every scheme's chunked `fill_spans_keyed` must reproduce its
@@ -1045,6 +1053,7 @@ mod span_source_tests {
                 PretokenizerType::DeepSeekV3,
                 PretokenizerType::Kimi,
                 PretokenizerType::SuperBPEStage1,
+                PretokenizerType::SuperwordBounded,
             ] {
                 check_source(pt.pretokenize(b), pt.pretokenize(b), "dispatch");
             }

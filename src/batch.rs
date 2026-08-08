@@ -213,7 +213,7 @@ fn build_doc_chunks<'a>(
     let mut emitted = 0usize;
     let mut acc = 0usize;
     for &doc in docs {
-        // `can_split == false` (the Superword scheme, whose learned merges
+        // `can_split == false` (the Superword schemes, whose learned merges
         // bridge whitespace) has no provably safe interior boundary, so an
         // oversized document stays one chunk instead of being fragmented.
         if can_split && doc.len() > 2 * target {
@@ -781,9 +781,18 @@ pub(crate) fn encode_docs_ragged_with(
 ) -> (Vec<u32>, Vec<i64>) {
     let total: usize = docs.iter().map(|d| d.len()).sum();
     let added = proto.added_token_split_blockers();
-    // The Superword scheme lifts whitespace splitting, so no interior cut is
+    // The Superword schemes lift whitespace splitting, so no interior cut is
     // provably pretoken-safe; every other scheme fragments oversized docs.
-    let can_split = proto.pretokenizer_type() != PretokenizerType::Superword;
+    // `safe_split_ranges` cuts on a space between two word characters, which
+    // is a pretoken boundary in every *word-splitting* scheme but sits in the
+    // middle of a piece under both of these: `Superword` yields the segment
+    // whole, and `SuperwordBounded`'s regex has no word alternative, so
+    // `word word` is one of the gaps between its matches (see
+    // `fast::superword_bounded`).
+    let can_split = !matches!(
+        proto.pretokenizer_type(),
+        PretokenizerType::Superword | PretokenizerType::SuperwordBounded
+    );
     let chunks = build_doc_chunks(docs, total, chunk_target_bytes(total), &added, lpt, can_split);
     encode_chunks_gathered(workers, proto, &chunks, total)
 }

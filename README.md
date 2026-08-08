@@ -4,7 +4,7 @@
 
 **Fast Rust trainers for BPE *and* SuperBPE — and a fast encoder for both.**
 
-*Train a 50k tokenizer in seconds, a 50k SuperBPE in minutes, then encode at hundreds of MB/s: **8× faster training** and **91× faster encoding** than HuggingFace `tokenizers`, on a SuperBPE that packs ~20% more text into every token.*
+*Train a 50k tokenizer in seconds, a 50k SuperBPE in minutes, then encode at hundreds of MB/s: **8× faster training** and **116× faster encoding** than HuggingFace `tokenizers`, on a SuperBPE that packs ~20% more text into every token.*
 
 ![supergigatoken vs the original SuperBPE](assets/superbpe_vs_original.png)
 
@@ -21,12 +21,12 @@ Supergigatoken trains and encodes both kinds of tokenizer natively, in Rust:
 
 - **`train_bpe(...)`** — the ordinary BPE trainer, inherited from gigatoken and benchmarked here against HuggingFace for the first time: **3.8× faster than `BpeTrainer`** at a matched 50k vocab on the same corpus (2.8 s vs 10.4 s on 100 MB), and 500 MB trains in 7 s.
 - **`train_superbpe(...)`** — the two-stage trainer. **8.0× faster than the original SuperBPE implementation** at matched settings, and it does not run out of memory where that one does.
-- **one encoder for both** — gigatoken's GB/s subword path, plus a `Superword` two-level mode (added here) that recovers most of a cached tokenizer's speed once whitespace pretokenization has been lifted. HuggingFace encodes SuperBPE slowly; tiktoken cannot represent it at all.
+- **one encoder for both** — gigatoken's GB/s subword path, plus a `Superword` two-level mode (added here) that recovers most of a cached tokenizer's speed once whitespace pretokenization has been lifted. It covers the tokenizer released with the paper as well as ones trained here. HuggingFace encodes SuperBPE slowly; tiktoken cannot represent it at all.
 - **an evaluation suite** under [`benchmarks/superbpe/`](benchmarks/superbpe/) — encoding efficiency, encoding throughput, trainer speed vs HuggingFace, and a trainer + vocabulary comparison against the original SuperBPE.
 
 Every number below is reproducible from that suite; each section names the script that emits it.
 
-It is a fork of [**gigatoken**](https://github.com/marcelroed/gigatoken), which is where the underlying speed comes from — SIMD pretokenization, a tuned pretoken cache, GB/s subword encoding, and HuggingFace/tiktoken compatibility. Supergigatoken is a strict superset: it keeps the `gigatoken` import name and CLI, so existing gigatoken code keeps working unchanged. The inherited subword throughput matrix (23 tokenizer families × 3 CPUs) is reproduced in [`benchmarks/compare/SUBWORD_THROUGHPUT.md`](benchmarks/compare/SUBWORD_THROUGHPUT.md) rather than here. What the **fork** adds is the SuperBPE half: `train_superbpe`, the `Superword` encoder and loader, the `superbpe_stage1` scheme, and the evaluation suite. `train_bpe` and the subword encoder come from gigatoken and are labelled as such wherever they appear below.
+It is a fork of [**gigatoken**](https://github.com/marcelroed/gigatoken), which is where the underlying speed comes from — SIMD pretokenization, a tuned pretoken cache, GB/s subword encoding, and HuggingFace/tiktoken compatibility. Supergigatoken is a strict superset: it keeps the `gigatoken` import name and CLI, so existing gigatoken code keeps working unchanged. The inherited subword throughput matrix (23 tokenizer families × 3 CPUs) is reproduced in [`benchmarks/compare/SUBWORD_THROUGHPUT.md`](benchmarks/compare/SUBWORD_THROUGHPUT.md) rather than here. What the **fork** adds is the SuperBPE half: `train_superbpe`, the `Superword` encoder and loader, the `superbpe_stage1` and `superword_bounded` schemes, and the evaluation suite. `train_bpe` and the subword encoder come from gigatoken and are labelled as such wherever they appear below.
 
 ## Encoding
 
@@ -57,10 +57,17 @@ Both engines load the *same* `tokenizer.json` and are handed the *same* pre-spli
 
 | Tokenizer | supergigatoken | HF tokenizers | speedup |
 |---|---:|---:|---:|
-| SuperBPE, 50k | **618.2 MB/s** | 6.8 MB/s | **91×** |
-| plain BPE, 50k | **2290.9 MB/s** | 4.1 MB/s | **556×** |
+| SuperBPE, 50k (trained here) | **730.0 MB/s** | 6.3 MB/s | **116×** |
+| released SuperBPE, 128k | **310.6 MB/s** | 4.9 MB/s | **63×** |
+| plain BPE, 50k | **2297.1 MB/s** | 4.0 MB/s | **577×** |
 
-SuperBPE is the harder case for both engines, and the reason is the same one that makes it fast to *use*: the exported tokenizer declares no pretokenization at all (`ByteLevel(use_regex=False)`), so each document arrives as one long pretoken. That is worth ~3.7× against our own plain-BPE path — and it costs HuggingFace an order of magnitude more, because it has no equivalent of the two-level trick below.
+The 128k row is the checkpoint released with the paper, which this fork could not load at all until recently — it ships an explicit `Split` regex rather than the whitespace-lifted export, so it takes a different outer scheme (`superword_bounded`) into the same two levels. It is not an apples-to-apples third row: different vocabulary, different corpus, and outer pretokens that its own regex has already bounded.
+
+SuperBPE is the harder case for both engines, and the reason is the same one that makes it fast to *use*: the exported tokenizer declares no pretokenization at all (`ByteLevel(use_regex=False)`), so each document arrives as one long pretoken. That is worth ~3.1× against our own plain-BPE path — and it costs HuggingFace an order of magnitude more, because it has no equivalent of the two-level trick below.
+
+**Read that table as ratios, not as four significant digits.** "Min of 9" takes the best of nine repeats *inside* one process; it does nothing about variance *between* processes, and on this box that is **±16% on the supergigatoken column against ±4% on the HuggingFace one** — five runs of the SuperBPE row at identical settings gave 618, 730, 745, 745 and 829 MB/s, against 6.3, 6.5 and 6.8 for HuggingFace. The asymmetry is the interesting part, and it is not a defect in the slower engine: supergigatoken finishes the 100 MB slice in 137 ms where HuggingFace needs 15.9 s, so its measurement is ~116× shorter and OS scheduling across 8 rayon workers becomes the dominant error term. The engine is fast enough that the harness is a good part of what is being measured.
+
+A sixth run came in at 511 MB/s and is excluded: three unrelated Python processes were started on the box while it ran. That is the same effect from the other side — the contaminated draw moved the 137 ms row by −31% and the 25 s plain-BPE row by −0.9% — and it is the practical reason to distrust any single draw here, including a fast one. The figures above are one run with the machine otherwise idle, landing within 0.5% of the five-run mean.
 
 #### How two-level encoding works
 
@@ -73,7 +80,11 @@ Most of it is recoverable. Merge priority is the token ID and stage-2 merges are
 
 Output is bit-identical to feeding the whole document to the byte-level merge loop — asserted token-for-token over the whole slice, not just on hand-picked cases.
 
-There is more to recover: this is still ~3.7× off the plain subword path (2291 MB/s at the same vocab), and the remaining cost is **33% level 1 / 67% level 2** — the merge, not the splitting, is now what is left to attack. For reference, HuggingFace encodes the released 128k SuperBPE checkpoint at ~6.1 MB/s; supergigatoken cannot fast-encode that one yet — see [Known Issues](#known-issues).
+There is more to recover: this is still ~3.1× off the plain subword path (2297 MB/s at the same vocab), and the remaining cost is **33% level 1 / 67% level 2** — the merge, not the splitting, is now what is left to attack.
+
+The same two levels run on the checkpoint released with the paper, whose exported pretokenizer keeps some outer boundaries instead of lifting them all. Level 2 then runs once per outer pretoken rather than once per document, which needs no new soundness argument but does shorten the runs it merges over. Single-threaded, on 33.5 MB of OpenWebText with the token streams asserted identical over all 6819 documents, that is **85.8 MB/s against 31.6 MB/s** for feeding each outer pretoken to the byte-level merge loop — 2.72×, at a derived threshold of 85956.
+
+That threshold is a *safety bound*, not the release's own stage-1/stage-2 boundary: the first merge it built to span whitespace is `" of"`+`" the"` at 100164, but a sound bound has to hold for every merge below it, including ones nobody designed. Merge 85956 is `b"\x8a"` + `b"\n"` — the tail byte of some multi-byte character joined to a newline, which is a real pretoken boundary for any character in that class that happens to be a letter. Choosing the smaller number costs almost nothing (it moves a handful of rare merges from level 1 to level 2, which carries the full table anyway) and is what makes the output bit-identical rather than nearly so. Verified against HuggingFace over the whole 99.7 MB slice: 16,007,082 tokens each, zero documents differing.
 
 ## Trainers
 
@@ -233,9 +244,11 @@ Supergigatoken builds on gigatoken (the fast encoder) and SuperBPE (the two-stag
 
 ## Known Issues
 
-* The fast `Superword` encoder currently loads SuperBPE tokenizers exported with a `ByteLevel(use_regex=False)` pretokenizer. The released 128k SuperBPE ships an explicit `Split`-regex pretokenizer that isn't mapped to `Superword` yet, so supergigatoken can't fast-encode that checkpoint (HuggingFace-only for now).
-* SuperBPE encoding lifts whitespace pretokenization, so each document is one long pretoken. Two-level encoding recovers most of the cached path (91× faster than HuggingFace) but is still ~3.7× below the plain subword path. Level 1 now runs on the SIMD two-phase fill, which moved the balance to **33% level 1 / 67% level 2**: the level-2 merge is where the remaining cost sits, and it is the next lever.
-* The level-1 splitter glues the pretokenizer boundaries a sub-threshold merge could otherwise span (whitespace runs, apostrophes, digit runs). A hazard it doesn't cover is safe but slow — it lowers the derived threshold, which moves work from level 1 to level 2. The `superbpe_stage1` scheme is still capped that way by `camelCase` letter-run splits (`" Mc"|"C"`, `" You"|"Tube"`), which will matter for any tokenizer genuinely trained with the original stage-1 regex.
+* SuperBPE encoding lifts whitespace pretokenization, so each document is one long pretoken. Two-level encoding recovers most of the cached path (116× faster than HuggingFace) but is still ~3.1× below the plain subword path. Level 1 now runs on the SIMD two-phase fill, which moved the balance to **33% level 1 / 67% level 2**: the level-2 merge is where the remaining cost sits, and it is the next lever.
+* The throughput figures carry ~±16% between-process variance on the supergigatoken column, against ~±4% on the HuggingFace one, because a 137 ms measurement across 8 rayon workers is far more exposed to OS scheduling than a 16 s one — and a busy box costs the fast row 30× more than the slow one. Treat the ratios as the result and the digits as one draw; `--repeats` only reduces variance *within* a process.
+* The released 128k's own outer regex has no SIMD scanner — `superword_bounded` is a scalar walker, because its boundaries are not a subset of stage 1's and so cannot be filtered out of the existing mask harvest. Measured at 578.6 MB/s it is 15% of that checkpoint's two-level cost, capping a vectorized replacement at 1.18×, so it is deferred rather than done.
+* The level-1 splitter glues the pretokenizer boundaries a sub-threshold merge could otherwise span. Whitespace runs, apostrophes, digit runs and non-ASCII-on-both-sides are glued always; word-initial right sides (`" Mc"|"C"`, `" ’"|"s"`) and whitespace after a combining mark are glued only for a tokenizer whose threshold that actually lifts, because they coarsen units and cost ~10% throughput (147.9 vs 163.9 MB/s) on one that doesn't. A hazard neither set covers stays safe but slow — it lowers the derived threshold, which moves work from level 1 to level 2.
+* Byte-level BPE merges *fragments* of characters, so a merge's operands need not be whole characters — and a junction that decodes to nothing on the right is a real boundary whose next character is merely unknown, not an interior one. Deriving the threshold as if it were interior mis-encoded Arabic letter + comma on both the released 128k and the 50k artifact committed here (5 tokens in 16,007,082). Fixed by enumerating a truncated character's completions and gluing non-ASCII pairs outright; the remaining conservatism is one arm, where the *left* operand opens mid-character and no valid probe can be built, capping the release's threshold at 85956 against a semantic transition of 100164.
 * Stage-2 training is O(n) in unit length; training large vocabs on hundreds of MB is minutes-scale. Stage 2 uses line-bounded units, so a superword can never span a newline — the reason supergigatoken's output is *outcome*-comparable to the original SuperBPE rather than byte-identical in its merges.
 
 Inherited from gigatoken and unchanged here: WordPiece is unsupported, SentencePiece models are far less optimized than BPE ones, file sinks are missing from the native API, Python iteration pays ABI3 overhead, and Windows is lightly tested (prefer WSL for perf work — though the SuperBPE suite, including the reference-trainer comparison, does run natively on it).

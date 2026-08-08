@@ -49,13 +49,13 @@ At matched vocab, supergigatoken reaches **1.26x** the bytes/token of gigatoken'
 
 _CPU: Intel64 Family 6 Model 189 Stepping 1, GenuineIntel (8 cores) · eval slice: 99.74 MB · 19937 docs · vocab=50000, transition=40000 · min of 9 repeats_
 
-gigatoken fast-encodes a SuperBPE tokenizer via the `Superword` pretokenizer (whitespace lifted). tiktoken is skipped — it cannot represent SuperBPE.
+gigatoken fast-encodes a SuperBPE tokenizer through the two-level `Superword` encoder — over the `superword` scheme for the tokenizers trained here (whitespace fully lifted) and over `superword_bounded` for the released checkpoint, whose exported `Split` regex keeps a few outer boundaries. tiktoken is skipped — it cannot represent SuperBPE.
 
 | Tokenizer | gigatoken MB/s | HF MB/s | speedup | gigatoken Mtok/s | HF Mtok/s |
 |---|---:|---:|---:|---:|---:|
-| `alisawuffles/superbpe-tokenizer-128k` | **-** | 6.1 | -x | - | 0.978 |
-| `gigatoken` | **2290.85** | 4.12 | 556.03x | 509.77 | 0.917 |
-| `supergigatoken` | **618.19** | 6.76 | 91.45x | 109.109 | 1.192 |
+| `alisawuffles/superbpe-tokenizer-128k` | **310.55** | 4.9 | 63.38x | 49.84 | 0.786 |
+| `gigatoken` | **2297.11** | 3.98 | 577.16x | 511.161 | 0.885 |
+| `supergigatoken` | **730.0** | 6.27 | 116.43x | 128.842 | 1.106 |
 
 ![Encoding throughput](throughput.png)
 

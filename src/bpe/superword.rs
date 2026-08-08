@@ -91,18 +91,29 @@
 //! artifact's threshold is exactly its transition point precisely so a new
 //! hazard shows up as a failing test rather than as lost throughput.
 //!
-//! One hazard class is deliberately *not* glued: the o200k-family schemes
-//! (`superbpe_stage1`) split case-structured letter runs, so `" Mc" | "C"`
-//! (merge 3243), `" You" | "Tube"`, `" Java" | "Script"` are all boundaries.
-//! That caps `superbpe_stage1` at 3243 on the committed artifact — which does
-//! not matter, because the artifact was trained with `gpt2` and
-//! [`SuperwordPlan::build`] takes the best candidate scheme. It *would* matter
-//! for a tokenizer genuinely trained with the original stage-1 regex (the
-//! released 128k), which needs a camelCase glue rule before its threshold can
-//! reach its transition point.
+//! One hazard class is glued only under the wide rule set: the o200k-family
+//! schemes (`superbpe_stage1`) split case-structured letter runs, so
+//! `" Mc" | "C"` (merge 3243), `" You" | "Tube"`, `" Java" | "Script"` are all
+//! boundaries. Left unglued that caps `superbpe_stage1` at 3243 on the
+//! committed artifact — which does not matter, because the artifact was trained
+//! with `gpt2` and [`SuperwordPlan::build_capped`] takes the best
+//! (scheme, rule set) pair. It matters a great deal for a tokenizer genuinely
+//! trained with the original stage-1 regex: the released 128k selects the wide
+//! set, which took it 485 → 13471 when that was the only fix in hand.
+//!
+//! The rest of the way to 85956 — within 15% of the release's transition point
+//! at 100164 — is the second hazard class, and it is unconditional
+//! ([`level1::non_ascii_pair`]): byte-level BPE merges *character fragments*, so
+//! a merge's operands need not be whole characters. `"ا"` + `b"\xd8"` is merge
+//! 13471 of the release — an Arabic letter plus a bare lead byte — and its
+//! junction is a real boundary whose right-hand class the merge does not
+//! reveal. Reading such a junction as interior is not conservative but wrong,
+//! and it made the release encode `"ا،"` as `[5438, 48629]` where HuggingFace
+//! gives `[13471, 221]`. See [`Junction`] for the taxonomy and
+//! [`open_right_can_split`] for what is enumerated instead.
 
 use crate::bpe::tiktoken::Tokenizer;
-use crate::pretokenize::fast::level1::glues;
+use crate::pretokenize::fast::level1::{glues, non_ascii_pair};
 use crate::pretokenize::{FastPretokenizerDispatch, Pretoken, PretokenizerType};
 use crate::token::TokenId;
 use rustc_hash::FxBuildHasher;
@@ -123,29 +134,72 @@ const CANDIDATE_SCHEMES: [PretokenizerType; 2] =
 const VERIFY_PAD: [&[u8]; 8] = [b"", b"x", b" ", b"  ", b"\n", b"1", b"!", b"'"];
 
 /// Level-1 splitting for the two-level encode over the *runtime*
-/// pretokenizer enum: the stage-1 scheme's pretokens, with adjacent
-/// pretokens glued across the four junction shapes a low-ID merge can span
-/// (see the module docs for the merge IDs each one otherwise costs) —
+/// pretokenizer enum: the stage-1 scheme's pretokens, with adjacent pretokens
+/// glued across the junction shapes a low-ID merge can span.
 ///
-/// - **whitespace on both sides**, which the `\s+(?!\S)` lookahead can cut
-///   mid-run: `"a  b"` yields `"a"` and `"  b"` instead of `"a"`, `" "`,
-///   `" b"`;
-/// - **a left side ending in an apostrophe**, because the contraction
-///   alternative makes `'s` its own pretoken — so `("'", "s")` is a low
-///   merge — while a greedy punctuation run swallows the apostrophe in
-///   `"x!'s"`, putting a boundary between them. Glued, `"!'"` and `"s"` stay
-///   in one unit.
-/// - **a left side *starting* with an apostrophe**, the contraction seen from
-///   its other end: `"'st"` splits as `"'s"`, `"t"`, so every contraction tail
-///   (`s`, `t`, `re`, `ve`, `m`, `ll`, `d`) is a hazardous left operand.
-///   Glued, `"'s"` and `"t"` stay together.
-/// - **a right side starting with a digit**, since `superbpe_stage1`'s
-///   `\p{N}{1,3}` takes no leading space and caps runs at three: `" "`+`"1"`
-///   and `"000"`+`"0"` both rejoin.
+/// Two rules carry almost all of it, and each one's cost in threshold is
+/// measured, not argued. Both are gated on `wide`, because they also have a
+/// cost in *throughput* — see below:
 ///
-/// All four are rare in prose, so the cache reuse level 1 exists for is intact.
-/// No rule is load-bearing on its own: [`derive_threshold`] probes *this*
-/// splitter, so a hazard the rules miss lowers the threshold instead of
+/// - **a right side starting with `\p{L}` or `\p{N}`.** Every stage-1
+///   alternative that can open a pretoken with a word character opens a fresh
+///   run there, so such a merge is reachable inside one stage-1 pretoken and
+///   is a stage-1 merge, not a superword. Unglued, `("’", "s")` caps the
+///   released 128k at **485**: stage 1's punctuation run is
+///   ` ?[^\s\p{L}\p{N}]+`, so `" ’s"` splits into `" ’"` and `"s"`. The class
+///   continues `’|t` 682, `-|s` 1269, `’|re` 1549, `.|S` 1920 — and it also
+///   covers the o200k family's case-structured letter runs (`" Mc"`+`"C"`,
+///   `" You"`+`"Tube"`) and `\p{N}{1,3}`'s digit rejoin (`"000"`+`"0"`).
+/// - **a right side starting with whitespace, after a left side ending in
+///   `\p{M}`.** The punctuation alternative swallows a `[\r\n/]*` tail, so
+///   punctuation followed by a newline is usually one pretoken already — but
+///   `\p{M}` reaches the *letter* alternative, which has no such tail, so
+///   `("\u{fe0f}", "\n")` is a genuine boundary and caps the vocabulary at
+///   **91476**. Gluing every non-word left side instead — which also subsumes
+///   the whitespace-on-both-sides case — buys no further threshold and costs
+///   another 2.8 points of throughput, so the rule is exactly as wide as the
+///   measurement asked for.
+///
+/// The whitespace-on-both-sides case that the `\s+(?!\S)` lookahead creates by
+/// cutting a run mid-way (`"a  b"` yields `"a"`, `"  b"`) is therefore its own
+/// rule, and unconditional: the fill can split a whitespace run for reasons of
+/// its own, so this one is about the walkers agreeing, not about a vocabulary.
+///
+/// Two apostrophe rules are likewise unconditional, both from the contraction
+/// alternative: a left side **ending** in `'`, because `("'", "s")` is a low
+/// merge while a greedy punctuation run puts a boundary inside `"x!'s"`; and a
+/// left side **starting** with `'`, the same seen from its other end, since
+/// `"'st"` splits as `"'s"`, `"t"` for every contraction tail. So is the digit
+/// rejoin, `\p{N}{1,3}`'s split inside a longer run.
+///
+/// What `wide` leaves as a split point is a word character followed by
+/// whitespace or punctuation — exactly the two shapes a real superword needs
+/// (`" of"`+`" the"` at 100164, `" don"`+`"'t"` at 100195). Every prose word
+/// boundary is one, so the cache reuse level 1 exists for survives.
+///
+/// # Why the rule set is derived rather than global
+///
+/// Gluing more is always sound: it only removes split points, and removing all
+/// of them is the plain path. It is not always *free*. Coarser units are rarer
+/// cache keys, and on the committed 50k artifact — whose threshold is its
+/// transition point under the narrow rules alone — the two `wide` rules
+/// measured **147.9 vs 163.9 MB/s**, −9.8% (`bench_superword_variants`,
+/// twophase+cuts, min of 5 over 33.5 MB of OWT), from collapsing `well-known`,
+/// `don't` and `(word` into single units under GPT2's ` ?\p{L}+`.
+///
+/// So the rule set joins the scheme as something [`derive_threshold`] is probed
+/// for rather than told: [`SuperwordPlan::build_capped`] tries all four
+/// (scheme, `wide`) combinations and keeps `wide` only where it buys strictly
+/// more prefix. The released 128k needs it and lands at 85956; the 50k artifact
+/// does not, stays narrow, and re-measured at 163.5 MB/s. (485 → 13471 → 85956
+/// is the release's threshold across the two fixes in the order they landed,
+/// `wide` then [`level1::non_ascii_pair`]. 485 is therefore the *pre-*
+/// `non_ascii_pair` narrow figure and understates what a narrow probe reaches
+/// today; the selection turns only on wide being strictly better, which
+/// `build_capped` re-derives per build rather than trusting this comment.)
+///
+/// No rule is load-bearing on its own either: [`derive_threshold`] probes
+/// *this* splitter, so a hazard the rules miss lowers the threshold instead of
 /// changing anyone's tokens.
 ///
 /// The encode path does not run this walker — it runs
@@ -156,16 +210,21 @@ const VERIFY_PAD: [&[u8]; 8] = [b"", b"x", b" ", b"  ", b"\n", b"1", b"!", b"'"]
 pub(crate) struct Level1Units<'a> {
     bytes: &'a [u8],
     inner: FastPretokenizerDispatch<'a>,
+    /// The plan's glue rule set, `glues`'s `wide`. A runtime field here — this
+    /// walker's scheme is a runtime value, so unlike the fill it cannot read the
+    /// flag off a scheme type.
+    wide: bool,
     /// Byte offsets of a pretoken pulled from `inner` that did not glue onto
     /// the unit just returned, and so starts the next one.
     pending: Option<(usize, usize)>,
 }
 
 impl<'a> Level1Units<'a> {
-    pub(crate) fn new(bytes: &'a [u8], scheme: PretokenizerType) -> Self {
+    pub(crate) fn new(bytes: &'a [u8], scheme: PretokenizerType, wide: bool) -> Self {
         Level1Units {
             bytes,
             inner: scheme.pretokenize(bytes),
+            wide,
             pending: None,
         }
     }
@@ -201,7 +260,11 @@ impl<'a> Level1Units<'a> {
         let mut prev_start = start;
         while let Some((next_start, next_end)) = self.next_inner() {
             debug_assert_eq!(next_start, end, "pretokens are consecutive");
-            if glues(&self.bytes[prev_start..end], &self.bytes[next_start..next_end]) {
+            if glues(
+                &self.bytes[prev_start..end],
+                &self.bytes[next_start..next_end],
+                self.wide,
+            ) {
                 prev_start = next_start;
                 end = next_end;
             } else {
@@ -248,29 +311,149 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for Level1Units<'a> {
     }
 }
 
-/// The last character of `a` and the first of `b`, or `None` when the
-/// junction between them is not a character boundary.
+/// The bytes a UTF-8 sequence led by `b` occupies, or `None` when `b` cannot
+/// lead one: continuation bytes, the always-overlong `0xc0`/`0xc1`, and
+/// `0xf5..` which is past U+10FFFF.
+fn utf8_len(b: u8) -> Option<usize> {
+    Some(match b {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    })
+}
+
+/// How a token's bytes sit relative to character boundaries, or `None` when
+/// they cannot occur inside valid UTF-8 at all.
 ///
 /// Byte-level BPE freely produces tokens that are *fragments* of characters
-/// (`b"\xd0\xbe\xd0"` — Cyrillic "о" plus a dangling lead byte — is token
-/// 6358 of the committed 50k artifact). A pretoken boundary in valid UTF-8
-/// input always falls between whole characters, so a junction that sits
-/// inside one can never be a level-1 boundary and the merge is safe by
-/// construction. Reporting `None` for those is what keeps fragment tokens
-/// from being mistaken for superwords: splitting their bytes with a
-/// pretokenizer describes an input that cannot occur.
-fn junction_chars(a: &[u8], b: &[u8]) -> Option<(char, char)> {
-    let last = (1..=4.min(a.len())).find_map(|k| {
-        let mut chars = std::str::from_utf8(&a[a.len() - k..]).ok()?.chars();
-        let c = chars.next()?;
-        chars.next().is_none().then_some(c)
-    })?;
-    let first = (1..=4.min(b.len())).find_map(|k| {
-        let mut chars = std::str::from_utf8(&b[..k]).ok()?.chars();
-        let c = chars.next()?;
-        chars.next().is_none().then_some(c)
-    })?;
-    Some((last, first))
+/// (`b"\xd0\xbe\xd0"` — Cyrillic "о" plus a dangling lead byte — is token 6358
+/// of the committed 50k artifact). A token may therefore open with up to three
+/// continuation bytes, the tail of a character that began before it, and may
+/// end owing bytes to a character that finishes after it; everything between
+/// has to be whole characters. Bytes of any other shape describe input that
+/// cannot exist, so every merge touching such a token is unreachable and safe.
+///
+/// Returns `(opens_inside_a_char, bytes_still_owed_at_the_end)`.
+fn utf8_shape(t: &[u8]) -> Option<(bool, Option<usize>)> {
+    let mut i = 0;
+    while i < t.len() && t[i] & 0xc0 == 0x80 {
+        i += 1;
+    }
+    // Four bytes is the longest sequence, so at most three of one can spill in.
+    if i > 3 {
+        return None;
+    }
+    let opens_inside = i > 0;
+    while i < t.len() {
+        let n = utf8_len(t[i])?;
+        if i + n > t.len() {
+            // A truncated head: whatever is present must still be continuations.
+            if t[i + 1..].iter().any(|&b| b & 0xc0 != 0x80) {
+                return None;
+            }
+            return Some((opens_inside, Some(i + n - t.len())));
+        }
+        // `from_utf8` is what rejects the sequences that are well-formed by
+        // length yet encode nothing: overlongs, surrogate halves, past U+10FFFF.
+        std::str::from_utf8(&t[i..i + n]).ok()?;
+        i += n;
+    }
+    Some((opens_inside, None))
+}
+
+/// Where a merge's junction can fall, judged from the operands' UTF-8 shape.
+///
+/// The distinction the first version of this code missed: a junction that
+/// yields no whole character on the right is *not* the same as one that cannot
+/// be a boundary. `"ا"` + `b"\xd8"` (merge 13471 of the released 128k) has a
+/// perfectly real boundary at its junction — the character starting there is
+/// merely unknown, since the merge carries only its lead byte. Treating that
+/// like a junction *inside* a character admitted the merge below the threshold,
+/// and level 1 then encoded `"ا،"` as `[5438, 48629]` against HuggingFace's
+/// `[13471, 221]`.
+enum Junction {
+    /// No level-1 boundary can fall here, so the merge is safe without probing:
+    /// either `a` ends inside a character and `b` continues it, or one operand's
+    /// bytes cannot occur in valid input at all.
+    Never,
+    /// Both sides meet on a character boundary and both characters are
+    /// determined by the operands' own bytes. The ordinary case.
+    Determined,
+    /// A real character boundary, but `b` holds only the head of the character
+    /// that starts at it and owes `missing` more bytes.
+    OpenRight { missing: usize },
+    /// A real character boundary, but `a` opens inside a character that began
+    /// before it, so no probe built from `a`'s bytes is valid UTF-8.
+    OpenLeft,
+}
+
+fn junction_of(a: &[u8], b: &[u8]) -> Junction {
+    let (Some((a_open, a_owed)), Some(_)) = (utf8_shape(a), utf8_shape(b)) else {
+        return Junction::Never;
+    };
+    if a_owed.is_some() {
+        // `a` ends inside a character and `b` continues it: the junction sits
+        // strictly inside that character, where no pretokenizer can split.
+        return Junction::Never;
+    }
+    let Some(&first) = b.first() else { return Junction::Never };
+    if first & 0xc0 == 0x80 {
+        // `a` ends a character and `b` opens with a continuation byte: not valid
+        // UTF-8 across the junction, so the pair never occurs.
+        return Junction::Never;
+    }
+    if a_open {
+        return Junction::OpenLeft;
+    }
+    match utf8_len(first) {
+        // `b` is nothing but a truncated head, so the character it begins is
+        // the one starting at *this* junction. (When `b` holds whole characters
+        // first, any debt at its end belongs to a later junction.)
+        Some(n) if n > b.len() => Junction::OpenRight { missing: n - b.len() },
+        _ => Junction::Determined,
+    }
+}
+
+/// Whether any completion of the character `b` only *begins* makes the junction
+/// splittable.
+///
+/// The class that decides the boundary is not in the merge: `b"\xd8"` reaches
+/// U+0600–U+063F, which holds Arabic letters and ARABIC COMMA alike. So every
+/// completion the head admits is probed and one splittable completion condemns
+/// the merge — the pretokenizer, not a class table, stays the authority, exactly
+/// as for a determined junction.
+///
+/// `missing` is 1, 2 or 3, so 64, 4096 or 262144 candidates before the validity
+/// filter, times [`VERIFY_PAD`]'s 64 contexts. Affordable because
+/// [`level1::non_ascii_pair`] settles every fragment junction whose left side is
+/// also non-ASCII first, and a *fragment* right side with an ASCII left side is
+/// rare: **38** merges of 127757 on the released 128k and 22 of 49744 on the
+/// committed artifact, with `b" "` the only left operand either one produces and
+/// `missing` never above 2. The 262144 arm is reachable in principle — a merge
+/// gluing a space to the lead byte of a 4-byte character would take it — and is
+/// left un-special-cased because it is one plan build, not a per-encode cost.
+fn open_right_can_split(a: &[u8], b: &[u8], missing: usize, scheme: PretokenizerType, wide: bool) -> bool {
+    let mut full = Vec::with_capacity(b.len() + missing);
+    for cand in 0..1u32 << (6 * missing) {
+        full.clear();
+        full.extend_from_slice(b);
+        // Most-significant group first, so the pushed bytes read in sequence
+        // order rather than reversed.
+        for k in (0..missing).rev() {
+            full.push(0x80 | ((cand >> (6 * k)) & 0x3f) as u8);
+        }
+        // Overlong, surrogate and out-of-range completions cannot occur in
+        // valid input, so they are not evidence of anything.
+        if std::str::from_utf8(&full).is_err() {
+            continue;
+        }
+        if junction_can_split(a, &full, scheme, wide) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `scheme` can place a level-1 boundary at the junction between the
@@ -296,7 +479,7 @@ fn junction_chars(a: &[u8], b: &[u8]) -> Option<(char, char)> {
 /// `camelCase` between two letters, and its `\p{N}{1,3}` splits a digit run
 /// every three digits. Leaving the real pretokenizers as the only authority
 /// on where boundaries fall is what keeps this honest when a scheme is added.
-fn junction_can_split(left: &[u8], right: &[u8], scheme: PretokenizerType) -> bool {
+fn junction_can_split(left: &[u8], right: &[u8], scheme: PretokenizerType, wide: bool) -> bool {
     let mut probe = Vec::with_capacity(left.len() + right.len() + 8);
     for pad_left in VERIFY_PAD {
         for pad_right in VERIFY_PAD {
@@ -306,7 +489,7 @@ fn junction_can_split(left: &[u8], right: &[u8], scheme: PretokenizerType) -> bo
             let junction = probe.len();
             probe.extend_from_slice(right);
             probe.extend_from_slice(pad_right);
-            if splits_at(&probe, junction, scheme) {
+            if splits_at(&probe, junction, scheme, wide) {
                 return true;
             }
         }
@@ -336,6 +519,7 @@ pub(crate) fn derive_threshold(
     vocab: &[Arc<[u8]>],
     merges: &HashMap<(TokenId, TokenId), TokenId, FxBuildHasher>,
     scheme: PretokenizerType,
+    wide: bool,
 ) -> Option<u32> {
     let mut by_id: Vec<(u32, TokenId, TokenId)> = merges
         .iter()
@@ -348,7 +532,34 @@ pub(crate) fn derive_threshold(
         let (Some(a), Some(b)) = (vocab.get(left.0 as usize), vocab.get(right.0 as usize)) else {
             continue;
         };
-        if junction_chars(a, b).is_some() && junction_can_split(a, b, scheme) {
+        // A junction the non-ASCII rule glues needs no probe at all: that rule
+        // reads exactly one byte per side and the merge carries both, so it
+        // holds for *every* completion of a truncated character and for every
+        // unknown left context. Checked before `junction_of` because it is what
+        // makes the open cases below rare enough to enumerate.
+        if non_ascii_pair(a, b) {
+            continue;
+        }
+        let can_split = match junction_of(a, b) {
+            Junction::Never => false,
+            Junction::Determined => junction_can_split(a, b, scheme, wide),
+            Junction::OpenRight { missing } => open_right_can_split(a, b, missing, scheme, wide),
+            // `a` opens inside a character, so the run it belongs to started
+            // outside the merge and no probe built from `a`'s bytes is valid
+            // UTF-8. Capping the threshold here is sound (a smaller one only
+            // moves work to level 2), and enumerating the prefixes that complete
+            // `a` — the mirror of `open_right_can_split` — would not raise it on
+            // either measured checkpoint: the 50k artifact has no such merge at
+            // all, and the released 128k's lowest is 85956, `b"\x8a"` + `b"\n"`,
+            // whose completions include り (`b"\xe3\x82\x8a"`). Letter-then-
+            // newline *is* a stage-1 boundary — `wide` glues whitespace after a
+            // combining mark, not after a letter — so the honest answer and the
+            // conservative one coincide. `open_left_cap_is_a_real_boundary`
+            // pins that, so the day a checkpoint pays for this arm, the test
+            // that justifies it is the one that fails.
+            Junction::OpenLeft => true,
+        };
+        if can_split {
             return Some(id);
         }
     }
@@ -356,9 +567,9 @@ pub(crate) fn derive_threshold(
 }
 
 /// Whether a level-1 unit boundary falls exactly at byte offset `at`.
-fn splits_at(bytes: &[u8], at: usize, scheme: PretokenizerType) -> bool {
+fn splits_at(bytes: &[u8], at: usize, scheme: PretokenizerType, wide: bool) -> bool {
     let mut pos = 0;
-    for unit in Level1Units::new(bytes, scheme) {
+    for unit in Level1Units::new(bytes, scheme, wide) {
         pos += unit.0.len();
         if pos == at {
             return true;
@@ -391,12 +602,12 @@ fn splits_at(bytes: &[u8], at: usize, scheme: PretokenizerType) -> bool {
 /// # The candidate set
 ///
 /// Every merge, **except** the ones [`derive_threshold`]'s scan positively
-/// cleared: result id below the threshold *and* a junction between two whole
-/// characters. Those cannot fire at a level-1 boundary by the threshold
-/// argument. Everything else counts — including the sub-threshold merges the
-/// scan skipped because their junction sits inside a character
-/// ([`junction_chars`] returned `None`), which is what keeps this mechanism
-/// from inheriting the scan's "pretoken boundaries fall between whole
+/// cleared: result id below the threshold, and a junction the scan either glued
+/// ([`non_ascii_pair`]) or probed and found unsplittable ([`Junction::Determined`]
+/// or [`Junction::OpenRight`]). Those cannot fire at a level-1 boundary by the
+/// threshold argument. Everything else counts — including the sub-threshold
+/// merges the scan skipped as [`Junction::Never`], which is what keeps this
+/// mechanism from inheriting the scan's "pretoken boundaries fall between whole
 /// characters" assumption. Extra candidates only ever *remove* cuts, so a
 /// misjudged one costs speed, never correctness.
 pub(crate) struct SuperwordCuts {
@@ -433,7 +644,15 @@ impl SuperwordCuts {
                 // — but there is nothing to mark from.
                 continue;
             };
-            if merged.0 < threshold && junction_chars(a, b).is_some() {
+            // Mirrors what `derive_threshold`'s scan positively *cleared*: a
+            // sub-threshold merge whose junction it either glued or probed and
+            // found unsplittable. `Junction::Never` is deliberately absent —
+            // those were skipped on a different argument, not cleared (see this
+            // type's docs). Widening the set only removes candidates, i.e. adds
+            // cuts, so the two predicates matching matters for speed here and
+            // for correctness only in `derive_threshold`.
+            let cleared = non_ascii_pair(a, b) || matches!(junction_of(a, b), Junction::Determined | Junction::OpenRight { .. });
+            if merged.0 < threshold && cleared {
                 continue;
             }
             // Byte suffixes of `a` / prefixes of `b` that are themselves vocab
@@ -512,6 +731,11 @@ pub(crate) struct SuperwordPlan {
     /// stage-1 encodings. Built once per load and forked per worker.
     pub(crate) stage1: Tokenizer,
     pub(crate) stage1_scheme: PretokenizerType,
+    /// The glue rule set `threshold` was derived under, and so the one level 1
+    /// must split with — `glues`'s `wide`. Part of the plan rather than a
+    /// global because the wide rules make units coarser, which costs level-1
+    /// cache hits on a vocabulary that does not need them (see `glues`).
+    pub(crate) stage1_wide_glue: bool,
     /// Merge-prefix bound: level 1 applies exactly the merges with a merged
     /// ID below this (see [`derive_threshold`]).
     pub(crate) threshold: u32,
@@ -597,8 +821,10 @@ impl SuperwordPlan {
     /// `bench_superword_glue_cost` can measure what a hazard costs *in one
     /// process*: the threshold is a load-time property, so the only way to A/B
     /// it is two plans, and reproducing an old glue rule set by capping is
-    /// exact — a hazard's whole effect is the threshold it forces — while
-    /// costing the shipped path nothing (no runtime branch in `glues`).
+    /// exact — a hazard's whole effect is the threshold it forces — without
+    /// adding a knob to the encode path. The one rule-set choice that *is* a
+    /// plan field, `stage1_wide_glue`, is there because it changes where units
+    /// end and not only which merges are level 1; capping cannot express it.
     pub(crate) fn build_capped(
         vocab: &Arc<Vec<Arc<[u8]>>>,
         vocab_inv: &HashMap<Arc<[u8]>, TokenId, FxBuildHasher>,
@@ -606,12 +832,20 @@ impl SuperwordPlan {
         byte_remapping: Option<&crate::bpe::ByteRemapping>,
         cap: u32,
     ) -> Option<SuperwordPlan> {
-        let (scheme, threshold) = CANDIDATE_SCHEMES
+        // Both stage-1 schemes and both glue rule sets, largest prefix wins:
+        // a larger prefix leaves less work for level 2. `false` before `true`
+        // and a non-strict `max_by_key` (which keeps the *last* maximum) would
+        // pick the wide rules on a tie, so the order is reversed — the narrow
+        // rules win when they reach the same threshold, and a vocabulary only
+        // pays for coarser units when they actually buy prefix.
+        let (scheme, wide, threshold) = CANDIDATE_SCHEMES
             .iter()
-            .filter_map(|&scheme| Some((scheme, derive_threshold(vocab, merges, scheme)?)))
-            // A larger prefix leaves less work for level 2.
-            .max_by_key(|&(_, threshold)| threshold)
-            .map(|(scheme, threshold)| (scheme, threshold.min(cap)))?;
+            .flat_map(|&scheme| [(scheme, true), (scheme, false)])
+            .filter_map(|(scheme, wide)| {
+                Some((scheme, wide, derive_threshold(vocab, merges, scheme, wide)?))
+            })
+            .max_by_key(|&(_, _, threshold)| threshold)
+            .map(|(scheme, wide, threshold)| (scheme, wide, threshold.min(cap)))?;
 
         let stage1_merges: HashMap<(TokenId, TokenId), TokenId, FxBuildHasher> = merges
             .iter()
@@ -630,6 +864,7 @@ impl SuperwordPlan {
         Some(SuperwordPlan {
             stage1,
             stage1_scheme: scheme,
+            stage1_wide_glue: wide,
             threshold,
             cuts: Arc::new(SuperwordCuts::build(vocab, vocab_inv, merges, threshold)),
             symbols: Vec::new(),
@@ -644,6 +879,7 @@ impl SuperwordPlan {
         SuperwordPlan {
             stage1: self.stage1.fork_sized(expected_bytes),
             stage1_scheme: self.stage1_scheme,
+            stage1_wide_glue: self.stage1_wide_glue,
             threshold: self.threshold,
             cuts: Arc::clone(&self.cuts),
             symbols: Vec::new(),
@@ -678,5 +914,14 @@ pub(crate) fn ends_with_whitespace_for_test(s: &[u8]) -> bool {
 #[cfg(test)]
 pub(crate) fn starts_with_whitespace_for_test(s: &[u8]) -> bool {
     crate::pretokenize::fast::level1::starts_with_whitespace(s)
+}
+
+/// Test hook for `open_left_cap_is_a_real_boundary`. The `Junction::OpenLeft`
+/// arm is justified by a claim about the *pretokenizer* — that the merge it
+/// caps on sits at a boundary a completed left operand really does produce — so
+/// the test has to reach the same probe `derive_threshold` reaches.
+#[cfg(test)]
+pub(crate) fn junction_can_split_for_test(left: &[u8], right: &[u8], scheme: PretokenizerType, wide: bool) -> bool {
+    junction_can_split(left, right, scheme, wide)
 }
 

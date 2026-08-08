@@ -350,7 +350,9 @@ def load_json(path: str) -> dict:
 
 
 def save_json(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # `or "."`: a bare filename (`--out results.json`) has no dirname, and
+    # `os.makedirs("")` raises FileNotFoundError rather than being a no-op.
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
