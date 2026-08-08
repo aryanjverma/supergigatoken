@@ -389,7 +389,7 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Read;
 
@@ -400,7 +400,8 @@ mod tests {
     const DS_SPLIT_3: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 
     /// HF `Split` with Isolated behavior: matches and the gaps between them.
-    fn split_isolated<'s>(re: &fancy_regex::Regex, s: &'s str) -> Vec<&'s str> {
+    /// Shared with `superword_bounded`, whose regex has the same shape.
+    pub(crate) fn split_isolated<'s>(re: &fancy_regex::Regex, s: &'s str) -> Vec<&'s str> {
         let mut pieces = Vec::new();
         let mut last = 0;
         for m in re.find_iter(s) {
