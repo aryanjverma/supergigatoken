@@ -147,6 +147,33 @@ def olmo3_tokenizer_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def bert_base_uncased_tokenizer_path() -> Path:
+    """Path to bert-base-uncased tokenizer.json in the HF cache.
+
+    WordPiece with `lowercase=true` and `strip_accents=null` (which HF resolves
+    to true), the reference case for the BERT pipeline."""
+    return _hf_tokenizer_json("google-bert/bert-base-uncased")
+
+
+@pytest.fixture(scope="session")
+def bert_base_cased_tokenizer_path() -> Path:
+    """Path to bert-base-cased tokenizer.json in the HF cache.
+
+    `strip_accents=null` with `lowercase=false`, so the null default resolves
+    the other way and accents survive."""
+    return _hf_tokenizer_json("google-bert/bert-base-cased")
+
+
+@pytest.fixture(scope="session")
+def bert_multilingual_tokenizer_path() -> Path:
+    """Path to bert-base-multilingual-cased tokenizer.json in the HF cache.
+
+    119k WordPiece vocab over 104 languages: CJK padding, non-Latin scripts,
+    and accents that are *not* stripped."""
+    return _hf_tokenizer_json("bert-base-multilingual-cased")
+
+
+@pytest.fixture(scope="session")
 def superbpe_128k_tokenizer_path() -> Path:
     """Path to the released SuperBPE 128k tokenizer.json in the HF cache.
 

@@ -1,6 +1,56 @@
 # Fast WordPiece (BERT family) — design
 
-Status: **designed, not implemented.** Branch `wordpiece`, forked from `v3`.
+Status: **implemented.** Branch `wordpiece`, forked from `v3`.
+
+## Corrections found during implementation
+
+Three claims below were wrong or incomplete, each caught by re-running the
+oracle rather than by reasoning. They are corrected in place further down; this
+list exists so a reader who remembers the original text knows what moved.
+
+1. **HF's Unicode predicates are not ICU's, in three places.** `tokenizers` gets
+   `is_punctuation` and friends from the `unicode_categories` crate, whose
+   bundled UCD is older than the `icu` crate's. Measured over every scalar:
+
+   | predicate | ICU says | HF says | delta |
+   |---|---|---|---|
+   | punctuation | 856 `\p{P}` | 726 | 141 not punct, 2 extra (U+166D `So`, U+111C9 `Mn`) |
+   | `clean_text` control | Cc∪Cf∪Co∪Cs | fewer | 20 kept (`Cf` to ICU, unknown to HF) |
+   | `strip_accents` mark | 2059 `Mn` | 1567 | **494** not marks, 2 extra (U+1734, U+1171E) |
+
+   All three delta lists are hardcoded in `pretokenize::unicode` with their
+   populations pinned, so an `icu` bump fails a test instead of silently
+   diverging. A table built from ICU alone passes an "agrees with ICU" test and
+   still mis-encodes Bengali, Telugu, Sogdian, Arabic, and Devanagari text.
+
+   The **mark** delta is the one that bites hardest and was missed on the first
+   pass: `strip_accents` is a *deletion*, so classifying a codepoint as a mark
+   that HF does not deletes it outright rather than merely moving a boundary.
+   U+111C9 SHARADA SANDHI MARK is the sharpest case — `Mn` to ICU, `Po` to HF —
+   so it must be **punctuation** to the splitter and **kept** by the normalizer
+   at the same time. It was found by the full-codepoint ID sweep (496 codepoints
+   diverged, of which 494 were this), not by reasoning.
+2. **The delta must be measured against ICU's own set, not a third UCD's.** The
+   first attempt subtracted HF's measured set from *Python 3.13's* `\p{P}`
+   (UCD 15.1), which silently omitted the 14 codepoints Unicode 16.0 newly
+   assigned as punctuation — they are unassigned in 15.1, so they never appear
+   in that difference. The resulting table over-punctuated by exactly 14
+   codepoints, which the pinned population count caught.
+3. **The `clean_text` fill order below omits U+FFFD.** HF removes NUL and U+FFFD
+   *by value* in the same filter as the control predicate. U+FFFD is `So`, so no
+   category fill reaches it and the documented order alone leaves it as a kept
+   character.
+4. **The decoder's `cleanup` has nine rules, not eleven.** Measured against
+   0.22.2: `" ' "` → `"'"` and `" do not"` → `" don't"` do **not** fire (a
+   `"cat ' s"` decode is unchanged), and neither do `" 'd"`/`" 'll"`.
+5. **The materialised normalizer cost 62.6% of encode, not "well under a
+   percent"** — see "Normalization strategy" below. Fixed to 27.4% (encode
+   1.88× faster) by bulk-copying ASCII runs instead of walking characters.
+
+One scope note: `WordPiece` is supplied to `Tokenizer::new_wordpiece` at
+construction rather than through a setter, because `from_tables` seeds the
+pretoken cache *during* construction — and seeded entries are cache hits the
+miss path never revisits.
 
 ## Goal
 
@@ -72,13 +122,18 @@ punctuation **isolated**. Empty pieces are dropped. So a pretoken is either a
 maximal run of non-whitespace non-punctuation chars, or a single punctuation
 char. Whitespace never appears in output.
 
-- **Punctuation set = Rust `is_ascii_punctuation` ∪ `\p{P}`.** Measured
-  isolated: ``!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~`` and `¡ « – ' 、 · ་`.
+- **Punctuation set = Rust `is_ascii_punctuation` ∪ HF's `is_punctuation`.**
+  Measured isolated: ``!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~`` and `¡ « – ' 、 · ་`.
   Measured **not** isolated: `× ÷ € ≠ ☃ ¦ ´ ˈ` and combining U+0301.
   So the ASCII set includes `$+<=>^`|~` (which are `Sc`/`Sm`/`Sk`, not `P`),
   but non-ASCII symbols are **not** punctuation. Neither `\p{S}` nor `\p{M}`
   qualifies outside ASCII — this is why the existing `DsCharClass` cannot be
   reused: it lumps `\p{P}` and `\p{S}` into one class.
+  **HF's `is_punctuation` is not modern `\p{P}`** — see correction 1 above. The
+  full-coverage sweep is `tests/tokenizers/test_wordpiece.py::test_bert_matches_hf_for_every_codepoint`,
+  which encodes `"a<c>a"` for all 1.1M scalars through both libraries and
+  compares IDs; that is the test that keeps the hardcoded deltas honest as
+  `tokenizers` and `icu` move independently.
 - **Whitespace = Unicode White_Space.** `U+00A0` and `U+2003` split;
   `U+200B` (ZWSP, `Cf`) does not.
 
@@ -113,7 +168,9 @@ four categories must be enumerated explicitly. Pin U+0378 in a test.
 
 Table fill order must therefore be: White_Space first, then the control set
 (so `U+0085`, which is both, ends up removed), then force `\t\n\r` back to
-whitespace.
+whitespace, **then force NUL and U+FFFD to removed** — HF drops those two by
+value in the same filter, and U+FFFD is `So`, so no category fill reaches it
+(correction 3 above). Finally, apply the 20-codepoint staleness delta as kept.
 
 **`handle_chinese_chars`**: each CJK char is replaced by `' ' + c + ' '`.
 Measured: `中文x → " 中  文 x"` (adjacent CJK yields a double space). Ranges are
@@ -167,6 +224,19 @@ spaces, then splice out ` ##`. `cleanup` additionally tidies spacing around
 punctuation and contractions. `Tokenizer::decode` currently just concatenates
 vocab bytes, so it needs a WordPiece mode.
 
+`cleanup`'s exact rule set, measured by decoding two-token pairs with the flag
+on and off (correction 4 above): `" ."`, `" ?"`, `" !"`, `" ,"`, `" n't"`,
+`" 'm"`, `" 's"`, `" 've"`, `" 're"` lose their space. Nine rules; the
+`" ' "` → `"'"` and `" do not"` → `" don't"` rules that older descriptions of
+this function list do not exist in 0.22.2.
+
+Decoding is **not** invertible for WordPiece (whitespace is dropped by the
+pretokenizer, case and accents by the normalizer), so the shared parity suite's
+`test_decode_roundtrip` cannot apply. `TokenizerSpec` grew a `lossless_decode`
+flag to say so out loud instead, and `test_wordpiece.py` asserts equality with
+HF's decoder — including `skip_special_tokens=False`, since gigatoken decodes
+every ID it is handed while HF's default drops specials.
+
 ## Normalization strategy
 
 HF's order is `normalize(whole text) → pretokenize → model`, but gigatoken's
@@ -184,6 +254,30 @@ SentencePiece backend already does this — `encode_normalized_cb`,
 Cost is one linear pass. ASCII lowercase is a few GB/s against an encode path
 running at hundreds of MB/s, so this should be well under a percent. Measure
 before optimising.
+
+**Measured, and this estimate was wrong by ~60×.** The first implementation cost
+**62.6%** of end-to-end encode (101.4 MB/s with the normalizer vs 271.0 without,
+32 MB of OWT single-threaded). Decomposing by step showed `clean_text` alone at
+47.2% — it rebuilt the document char by char with a class-table load per
+character — while NFD, the step that looks expensive, was 0.2%. Bulk-copying runs
+of printable ASCII (the scan `PrecompiledCharsmap::normalize_into` already uses)
+in both the clean pass and the fold pass took it to **27.4%**, i.e. encode from
+101.4 to 190.5 MB/s, **1.88×**. Full numbers and the two failed attempts along the
+way are in `pretokenizer_optimization_log.md`.
+
+Two lessons worth carrying forward:
+
+- A **whole-segment** ASCII precheck is worthless here. Gating on "printable ASCII
+  and no uppercase" over a segment never fires — uppercase is everywhere, and even
+  after fixing that, one newline disqualifies a 1 MB document. The win exists only
+  per *run*.
+- The bulk paths rest on arguments about treating an ASCII run as opaque, so they
+  are backed by `bert_normalizer_matches_reference_random`, which fuzzes against a
+  straightforward four-pass reference across all 24 flag combinations. The
+  reference stays in the file as the permanent oracle.
+
+At 27.4% the deferred raw-keyed design below is still indicated on cost grounds;
+the measurement above is what its ceiling is worth.
 
 **Deferred: raw-keyed, normalize-on-miss.** Key the cache on raw input bytes,
 normalize each word only on the ~1% miss path, fold `handle_chinese_chars` into

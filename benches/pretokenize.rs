@@ -6,8 +6,8 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 ))]
 use gigatoken_rs::pretokenize::reference::avx512::Avx512PretokenizerIter;
 use gigatoken_rs::pretokenize::{
-    reference::combinator::pretokens_iterator, FastCl100kPretokenizer, FastQwen2Pretokenizer,
-    FastQwen35Pretokenizer, FastR50kPretokenizer, PretokenizerIter,
+    reference::combinator::pretokens_iterator, FastBertPretokenizer, FastCl100kPretokenizer,
+    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PretokenizerIter,
 };
 use gigatoken_rs::pretokenize::reference::simd::SimdPretokIter;
 use std::hint::black_box;
@@ -109,6 +109,21 @@ fn pretokenize_benches(c: &mut Criterion) {
     group.bench_function("qwen3_5_fast_scalar", |b| {
         b.iter(|| {
             let mut iter = FastQwen35Pretokenizer::new(&input);
+            let mut count = 0;
+            while iter.next().is_some() {
+                count += 1;
+            }
+            black_box(count);
+        });
+    });
+
+    // BERT/WordPiece. Unlike the schemes above, this one runs downstream of a
+    // materialised `BertNormalizer`, so its real input has no control chars and
+    // no whitespace but U+0020; raw OWT is close enough to that shape (and is
+    // what every other row here measures) to be the comparable number.
+    group.bench_function("bert_fast_scalar", |b| {
+        b.iter(|| {
+            let mut iter = FastBertPretokenizer::new(&input);
             let mut count = 0;
             while iter.next().is_some() {
                 count += 1;

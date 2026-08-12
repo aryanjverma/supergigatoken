@@ -10,11 +10,13 @@ use crate::bpe::{
 use crate::bpe::bpe_merge_symbols_short_neon;
 use crate::pretokenize::fast::level1::Level1Spans;
 use crate::pretokenize::{
-    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
-    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PRETOKEN_CHUNK,
-    Pretoken, PretokenSpans, PretokenizerType, SpanBatch, SpanIter, pack_pretoken_key,
-    pretoken_key_hash,
+    FastBertPretokenizer, FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer,
+    FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    PRETOKEN_CHUNK, Pretoken, PretokenSpans, PretokenizerType, SpanBatch, SpanIter,
+    pack_pretoken_key, pretoken_key_hash,
 };
+use crate::bpe::bert_normalizer::{BertNormalizer, BertScratch};
+use crate::bpe::wordpiece::WordPiece;
 use crate::token::TokenId;
 use eyre::Result;
 use std::collections::HashMap;
@@ -92,6 +94,15 @@ pub struct Tokenizer {
     /// would decompose differently (GLM-5.2 has ~97k such words); a plain
     /// merge walk diverges from HF on those.
     ignore_merges: bool,
+    /// WordPiece model (BERT family). When set, the pretoken-miss path runs
+    /// MaxMatch instead of the BPE merge loop, and the vocab cache seed is
+    /// computed the same way. `Arc` so `fork`/`fork_sized` share one copy,
+    /// like `merges`/`vocab`. Mutually exclusive with `merges` being
+    /// meaningful: a WordPiece model has no merge list.
+    wordpiece: Option<Arc<WordPiece>>,
+    /// HF `BertNormalizer`, applied to each added-token-delimited segment in
+    /// [`Self::for_each_piece`] before pretokenization — HF's own order.
+    normalizer: Option<Arc<BertNormalizer>>,
     /// Two-level encode plan for SuperBPE tokenizers, installed by
     /// [`Self::enable_superword_two_level`] and `None` for everything else.
     /// When set, segments take [`Self::superword_encode_segment`] instead of
@@ -121,6 +132,42 @@ fn nfc_segment<'a>(seg: &'a [u8], buf: &'a mut String) -> &'a [u8] {
     nfc.normalize_to(s, buf)
         .expect("writing to a String cannot fail");
     buf.as_bytes()
+}
+
+/// HF's `decoders::wordpiece` `cleanup`: undo the spaces the space-join
+/// inserted before sentence punctuation and before English contraction
+/// suffixes.
+///
+/// This exact set was **measured** against `tokenizers` 0.22.2 by decoding
+/// two-token pairs with `cleanup` on and off and diffing (see the probe in the
+/// design doc). Two rules that older write-ups of this function list do NOT
+/// fire in 0.22.2 and are deliberately absent: `" ' "` → `"'"` (measured:
+/// `"cat ' s"` decodes unchanged) and `" do not"` → `" don't"` (measured:
+/// `"hello do not"` decodes unchanged). `" 'd"` and `" 'll"` are likewise not
+/// cleaned, even though `" 'm"`/`" 's"`/`" 've"`/`" 're"` are.
+///
+/// No rule's replacement can create or destroy another's match, so the nine
+/// are order-independent — but they are applied in HF's order regardless, so a
+/// future addition inherits the right sequencing.
+fn wordpiece_cleanup(s: &str) -> String {
+    const REPLACEMENTS: [(&str, &str); 9] = [
+        (" .", "."),
+        (" ?", "?"),
+        (" !", "!"),
+        (" ,", ","),
+        (" n't", "n't"),
+        (" 'm", "'m"),
+        (" 's", "'s"),
+        (" 've", "'ve"),
+        (" 're", "'re"),
+    ];
+    let mut out = s.to_string();
+    for (from, to) in REPLACEMENTS {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+    out
 }
 
 /// Cache-value packing (shared by the short-pretoken table and decode in
@@ -310,7 +357,22 @@ impl Tokenizer {
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
         let vocab = vocab.into_iter().map(Into::into).collect();
-        Self::from_tables(merges, None, vocab, byte_remapping)
+        Self::from_tables(merges, None, vocab, byte_remapping, None)
+    }
+
+    /// Construct a WordPiece tokenizer (BERT family): no merges, no byte
+    /// remapping, and the `wordpiece` model driving both the miss path and the
+    /// vocab cache seed.
+    ///
+    /// The model has to be supplied *here* rather than through a setter,
+    /// because [`Self::from_tables`] seeds the pretoken cache during
+    /// construction. A cache seeded with BPE semantics over a merge-less vocab
+    /// would map every short vocab entry to its raw bytes as token IDs, and
+    /// those seeded entries are cache *hits* — the miss path would never get a
+    /// chance to correct them.
+    pub fn new_wordpiece(wordpiece: Arc<WordPiece>, vocab: Vec<Vec<u8>>) -> Self {
+        let vocab = vocab.into_iter().map(Into::into).collect();
+        Self::from_tables(HashMap::default(), None, vocab, None, Some(wordpiece))
     }
 
     /// Construct from an explicit-rank merge table (`ranked_merge_key(a, b)`
@@ -323,7 +385,13 @@ impl Tokenizer {
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
         let vocab = vocab.into_iter().map(Into::into).collect();
-        Self::from_tables(HashMap::default(), Some(ranked_merges), vocab, byte_remapping)
+        Self::from_tables(
+            HashMap::default(),
+            Some(ranked_merges),
+            vocab,
+            byte_remapping,
+            None,
+        )
     }
 
     /// Shared construction tail ([`Self::new`], [`Self::new_ranked`] and
@@ -338,6 +406,7 @@ impl Tokenizer {
         ranked_merges: Option<RankedMerges>,
         vocab: Vec<Arc<[u8]>>,
         byte_remapping: Option<ByteRemapping>,
+        wordpiece: Option<Arc<WordPiece>>,
     ) -> Self {
         let vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher> = vocab
             .iter()
@@ -357,6 +426,7 @@ impl Tokenizer {
             pair_ranks.as_deref(),
             &merges,
             ranked_merges.as_deref(),
+            wordpiece.as_deref(),
             false,
             &vocab_inv,
             &mut token_arena,
@@ -380,6 +450,8 @@ impl Tokenizer {
             normalize_nfc: false,
             add_prefix_space: false,
             ignore_merges: false,
+            wordpiece,
+            normalizer: None,
             superword: None,
         }
     }
@@ -422,6 +494,7 @@ impl Tokenizer {
         pair_ranks: Option<&PairRankTable>,
         merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         ranked_merges: Option<&RankedMerges>,
+        wordpiece: Option<&WordPiece>,
         ignore_merges: bool,
         vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
         token_arena: &mut Vec<TokenId>,
@@ -448,6 +521,7 @@ impl Tokenizer {
                     pair_ranks,
                     merges,
                     ranked_merges,
+                    wordpiece,
                     ignore_merges,
                     vocab_inv,
                     bytes,
@@ -498,11 +572,33 @@ impl Tokenizer {
         pair_ranks: Option<&PairRankTable>,
         merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         ranked_merges: Option<&RankedMerges>,
+        wordpiece: Option<&WordPiece>,
         ignore_merges: bool,
         vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
         bytes: &[u8],
         buf: &mut [TokenId; SHORT_MERGE_MAX],
     ) -> usize {
+        // WordPiece routes through the same `encode_unit` the miss path runs,
+        // so a seeded value can never disagree with a cold miss — the
+        // invariant this function's docs establish for BPE. Note the values
+        // are NOT simply each entry's own ID: `##ing` is not a whole word (its
+        // key in `cont` is `ing`, which as a *word* may segment differently),
+        // and a whole word in the vocab MaxMatches to its own single ID
+        // anyway, so routing through the algorithm is both correct and
+        // simplest.
+        if let Some(wp) = wordpiece {
+            // A short vocab entry is ≤ 15 bytes and each piece consumes ≥ 1
+            // byte, so at most 15 tokens come back — always within
+            // SHORT_MERGE_MAX. The `Vec` is a load-time-only allocation (once
+            // per short vocab entry, ~30k for bert-base-uncased) that keeps
+            // `encode_unit` the single implementation of the algorithm.
+            let mut out = Vec::with_capacity(SHORT_MERGE_MAX);
+            let n = wp.encode_unit(bytes, &mut out);
+            debug_assert!(n <= SHORT_MERGE_MAX, "short vocab entry over-segmented");
+            let n = n.min(SHORT_MERGE_MAX);
+            buf[..n].copy_from_slice(&out[..n]);
+            return n;
+        }
         match ranked_merges {
             Some(rm) => Self::seed_symbols_ranked(
                 byte_remapping,
@@ -658,7 +754,7 @@ impl Tokenizer {
         }
 
         let byte_remapping = ByteRemapping::from_byte_vocab(&vocab)?;
-        Ok(Self::from_tables(merges, None, vocab, byte_remapping))
+        Ok(Self::from_tables(merges, None, vocab, byte_remapping, None))
     }
 
     /// Create a new tokenizer sharing the same model data but with a
@@ -709,6 +805,7 @@ impl Tokenizer {
             self.pair_ranks.as_deref(),
             &self.merges,
             self.ranked_merges.as_deref(),
+            self.wordpiece.as_deref(),
             self.ignore_merges,
             &self.vocab_inv,
             &mut token_arena,
@@ -746,6 +843,9 @@ impl Tokenizer {
             normalize_nfc: self.normalize_nfc,
             add_prefix_space: self.add_prefix_space,
             ignore_merges: self.ignore_merges,
+            // Both are immutable model data; a fork shares one copy.
+            wordpiece: self.wordpiece.clone(),
+            normalizer: self.normalizer.clone(),
             // The level-1 tokenizer carries the bulk of a superword
             // encode's cache traffic, so a worker's fork gets its own,
             // sized the same way.
@@ -799,6 +899,14 @@ impl Tokenizer {
     /// `"a \t b"`) cannot matter, because no merge crosses an outer boundary on
     /// either path.
     pub fn enable_superword_two_level(&mut self) {
+        // A WordPiece model has no merge table, so there is no threshold to
+        // derive and nothing to split into stage-1/superword halves. The scheme
+        // test below already excludes it (WordPiece implies `Bert`), but state
+        // the incompatibility rather than leaving it to a coincidence.
+        if self.wordpiece.is_some() {
+            debug_assert!(self.superword.is_none());
+            return;
+        }
         if !matches!(
             self.pretokenizer_type,
             PretokenizerType::Superword | PretokenizerType::SuperwordBounded
@@ -916,6 +1024,7 @@ impl Tokenizer {
                 self.pair_ranks.as_deref(),
                 &self.merges,
                 self.ranked_merges.as_deref(),
+                self.wordpiece.as_deref(),
                 ignore_merges,
                 &self.vocab_inv,
                 bytes,
@@ -971,6 +1080,7 @@ impl Tokenizer {
                 self.pair_ranks.as_deref(),
                 &self.merges,
                 self.ranked_merges.as_deref(),
+                self.wordpiece.as_deref(),
                 self.ignore_merges,
                 &self.vocab_inv,
                 content,
@@ -1100,7 +1210,11 @@ impl Tokenizer {
     /// the same out-of-line concrete fills a hardcoded pretokenizer uses.
     fn for_each_piece(&mut self, bytes: &[u8], mut f: impl FnMut(&mut Self, Piece<'_>)) {
         let normalize_nfc = self.normalize_nfc;
+        // Cloned out of `self` so the segment it produces can be borrowed
+        // across the `f(self, ...)` call below, like `normalize_nfc`.
+        let bert = self.normalizer.clone();
         let mut nfc_buf = String::new();
+        let mut bert_scratch = BertScratch::default();
         let mut prefix_buf = Vec::new();
         let mut pos = 0;
         while pos < bytes.len() {
@@ -1121,6 +1235,13 @@ impl Tokenizer {
             } else {
                 &bytes[pos..seg_end]
             };
+            // HF normalizes each added-token-delimited chunk independently, so
+            // this sits exactly where the NFC normalizer does. The two never
+            // coexist in practice (BERT declares `BertNormalizer`, Qwen-style
+            // exports declare `NFC`), but nothing here depends on that.
+            if let Some(n) = bert.as_deref() {
+                segment = n.normalize(segment, &mut bert_scratch);
+            }
             if self.add_prefix_space && !segment.is_empty() && segment[0] != b' ' {
                 prefix_buf.clear();
                 prefix_buf.push(b' ');
@@ -1651,6 +1772,38 @@ impl Tokenizer {
         }
     }
 
+    /// Outlined miss path for WordPiece models: the same cache bookkeeping as
+    /// [`Self::encode_pretoken_miss`], with MaxMatch in place of the merge
+    /// loop.
+    ///
+    /// Unlike BPE there is no byte-symbol initialization step and no scratch
+    /// merge state — `encode_unit` goes straight from bytes to token IDs — so
+    /// the long-pretoken arm needs only the `Vec` scratch to hold the result.
+    #[cold]
+    #[inline(never)]
+    fn encode_pretoken_miss_wordpiece(
+        &mut self,
+        bytes: &[u8],
+        key: u128,
+        h: u64,
+        slot: usize,
+        out: &mut Vec<u32>,
+    ) {
+        let wp = self.wordpiece.clone().expect("caller checked wordpiece");
+        self.symbol_scratch.clear();
+        wp.encode_unit(bytes, &mut self.symbol_scratch);
+        if key != 0 {
+            let (val, ext) = Self::pack_val(&self.symbol_scratch, &mut self.token_arena);
+            self.pretoken_cache.insert_at(slot, key, h, val, ext);
+        } else if bytes.len() <= LONG_CACHE_MAX {
+            let len = self.symbol_scratch.len() as u32;
+            let offset = self.token_arena.len() as u32;
+            self.token_arena.extend_from_slice(&self.symbol_scratch);
+            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+        }
+        out.extend_from_slice(token_ids_as_u32s(&self.symbol_scratch));
+    }
+
     /// Cache-miss path of the probe/emit loop: BPE-encode `bytes`, record
     /// it in the table `key` routes to (the short-pretoken table, or the
     /// long map when `key == 0`), and append its tokens to `out`. `slot`
@@ -1666,6 +1819,15 @@ impl Tokenizer {
         slot: usize,
         out: &mut Vec<u32>,
     ) {
+        // WordPiece first, and specifically **before** any byte remapping:
+        // `byte_remapping` is `None` for a WordPiece tokenizer and the BPE
+        // fallback below maps byte `b` to `TokenId(b)`, which is meaningless in
+        // a WordPiece vocab. Like the ranked test, this is one
+        // perfectly-predicted branch for every BPE tokenizer, so the BPE
+        // codegen is unchanged.
+        if self.wordpiece.is_some() {
+            return self.encode_pretoken_miss_wordpiece(bytes, key, h, slot, out);
+        }
         // Rank-mapped vocabularies take the outlined
         // ranked miss path; the branch is one perfectly-predicted test for
         // everything else, keeping this function's codegen identical to a
@@ -1750,6 +1912,46 @@ impl Tokenizer {
             .copied()
     }
 
+    /// Decode a WordPiece token stream the way HF's `WordPiece` decoder does:
+    /// join the pieces with spaces, then splice out every ` <prefix>` so
+    /// continuation pieces rejoin their word.
+    ///
+    /// This cannot be an inverse of encoding — the pretokenizer *drops*
+    /// whitespace, so the original spacing is not recoverable — which is why HF
+    /// ships a decoder that re-inserts spaces heuristically. `cleanup` (on by
+    /// default in every BERT export) additionally tidies the spacing HF's own
+    /// detokenizer would leave around punctuation and English contractions.
+    ///
+    /// Returns `None` for a tokenizer with no WordPiece model, so callers keep
+    /// using [`Self::decode`] for byte-level vocabularies.
+    pub fn decode_wordpiece(&self, v: &[TokenId], cleanup: bool) -> Option<String> {
+        let prefix = self.wordpiece.as_ref()?.prefix();
+        let mut out = String::new();
+        for (i, &token) in v.iter().enumerate() {
+            let piece = String::from_utf8_lossy(self.vocab[token.0 as usize].as_ref());
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&piece);
+        }
+        if !prefix.is_empty() {
+            let joined = format!(" {prefix}");
+            out = out.replace(&joined, "");
+        }
+        Some(if cleanup { wordpiece_cleanup(&out) } else { out })
+    }
+
+    /// Install HF's `BertNormalizer`. Loader-phase mutator, like every other
+    /// `Tokenizer` mutation (see [`Self::set_pretokenizer_type`]).
+    pub fn set_bert_normalizer(&mut self, normalizer: Option<Arc<BertNormalizer>>) {
+        self.normalizer = normalizer;
+    }
+
+    /// The WordPiece model, if this is a WordPiece tokenizer.
+    pub fn wordpiece(&self) -> Option<&WordPiece> {
+        self.wordpiece.as_deref()
+    }
+
     /// Detailed cache stats for memory accounting (see examples/cache_memory.rs):
     /// (short_len, short_cap, long_len, long_cap, long_key_bytes, arena_len, arena_cap).
     pub fn cache_mem_stats(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
@@ -1831,6 +2033,16 @@ mod test_util {
         path
     }
 
+    /// A BERT repo's tokenizer.json, or `None` (with a note) when it is not in
+    /// the local HF cache — Rust tests never download.
+    pub(super) fn bert_path(repo: &str) -> Option<std::path::PathBuf> {
+        let path = crate::test_hub::hf_tokenizer_json(repo);
+        if path.is_none() {
+            eprintln!("Skipping: {repo} tokenizer.json not in the HF cache");
+        }
+        path
+    }
+
     /// xorshift64: deterministic, dependency-free RNG for test inputs.
     pub(super) struct XorShift64(pub u64);
 
@@ -1849,6 +2061,152 @@ mod tests {
     use super::*;
     use crate::load_tokenizer::tiktoken::load_tiktoken;
     use std::io::Read;
+
+    /// Real BERT tokenizers, token-for-token against `tokenizers` 0.22.2.
+    /// Every expectation was produced by
+    /// `Tokenizer.encode(case, add_special_tokens=False).ids`, so this pins the
+    /// whole pipeline — BertNormalizer, the `bert` walker, MaxMatch, and the
+    /// vocab-seeded cache — against the oracle rather than against itself.
+    ///
+    /// Skips when the repo is not in the local HF cache (Rust tests never
+    /// download); the Python suite covers these repos with a downloading
+    /// fixture.
+    #[test]
+    fn bert_base_uncased_matches_hf_reference() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::bert_path("google-bert/bert-base-uncased") else {
+            return;
+        };
+        let mut tok = load_hf_bpe(&path).expect("bert-base-uncased must load");
+        assert_eq!(tok.pretokenizer_type(), PretokenizerType::Bert);
+        assert!(tok.wordpiece().is_some(), "WordPiece model must be installed");
+        assert!(tok.superword_threshold().is_none(), "no two-level plan for WordPiece");
+
+        let cases: &[(&str, &[u32])] = &[
+            // Lowercasing and accent stripping happen before the split.
+            ("Unaffable Cafe!", &[14477, 20961, 3468, 7668, 999]),
+            ("hello world", &[7592, 2088]),
+            (
+                "The quick brown fox jumps over the lazy dog.",
+                &[1996, 4248, 2829, 4419, 14523, 2058, 1996, 13971, 3899, 1012],
+            ),
+            // Continuation pieces, several in a row.
+            ("zzzqqq", &[1062, 13213, 4160, 4160, 4160]),
+            // The apostrophe is punctuation, so it isolates.
+            ("don't", &[2123, 1005, 1056]),
+            // ZWSP is removed by clean_text, joining the word into one pretoken.
+            ("a\u{200b}b", &[11113]),
+            // U+0378 is unassigned, so clean_text KEEPS it — and no vocab piece
+            // covers it, so the whole word collapses to one [UNK].
+            ("x\u{378}y", &[100]),
+        ];
+        for (case, want) in cases {
+            let mut got: Vec<u32> = Vec::new();
+            tok.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+            assert_eq!(&got, want, "diverged on {case:?}");
+        }
+    }
+
+    /// The cased multilingual model: `strip_accents: null` with
+    /// `lowercase: false` resolves to *no* stripping, and CJK is padded into
+    /// its own pretokens by the normalizer.
+    #[test]
+    fn bert_base_multilingual_cased_matches_hf_reference() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::bert_path("bert-base-multilingual-cased") else {
+            return;
+        };
+        let mut tok = load_hf_bpe(&path).expect("bert-base-multilingual-cased must load");
+        let cases: &[(&str, &[u32])] = &[
+            ("Unaffable Cafe!", &[12148, 43311, 11203, 68903, 106]),
+            ("hello world", &[61694, 10133, 11356]),
+            (
+                "The quick brown fox jumps over the lazy dog.",
+                &[10117, 69609, 31299, 174, 31978, 54941, 10107, 10491, 10105, 10109, 12547, 17835, 119],
+            ),
+            ("zzzqqq", &[194, 46671, 11703, 11703, 11703]),
+            ("don't", &[16938, 112, 188]),
+            ("a\u{200b}b", &[11357]),
+            ("x\u{378}y", &[100]),
+        ];
+        for (case, want) in cases {
+            let mut got: Vec<u32> = Vec::new();
+            tok.encode_with_added_tokens_flat(case.as_bytes(), &mut got);
+            assert_eq!(&got, want, "diverged on {case:?}");
+        }
+    }
+
+    /// Pretokens longer than 15 bytes take the long-cache arm of the miss path
+    /// (`key == 0`), which the short words in the tests above never reach. The
+    /// 100-char cap and the `LONG_CACHE_MAX` no-cache branch live here too.
+    /// All four expectations measured against `tokenizers` 0.22.2.
+    #[test]
+    fn bert_long_pretokens_match_hf_reference() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::bert_path("google-bert/bert-base-uncased") else {
+            return;
+        };
+        let mut tok = load_hf_bpe(&path).expect("bert-base-uncased must load");
+
+        // 34 bytes: past the 15-byte short key, well under the char cap.
+        let mut got: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(b"supercalifragilisticexpialidocious", &mut got);
+        assert_eq!(
+            got,
+            vec![3565, 9289, 10128, 29181, 24411, 4588, 10288, 19312, 21273, 10085, 6313]
+        );
+
+        // Exactly at the 100-char cap: segments normally (50 tokens).
+        let at_cap = "a".repeat(100);
+        let mut got: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(at_cap.as_bytes(), &mut got);
+        let mut want = vec![13360u32];
+        want.extend(std::iter::repeat_n(11057u32, 48));
+        want.push(2050);
+        assert_eq!(got, want, "100 chars must be under the cap");
+
+        // One char over: the whole word becomes a single [UNK].
+        for n in [101usize, 600] {
+            let over = "a".repeat(n);
+            let mut got: Vec<u32> = Vec::new();
+            tok.encode_with_added_tokens_flat(over.as_bytes(), &mut got);
+            assert_eq!(got, vec![100], "{n} chars must exceed the cap");
+        }
+
+        // Repeat everything on a second pass so the long-cache *hit* path is
+        // exercised, not just the insert.
+        let text = "supercalifragilisticexpialidocious pneumonoultramicroscopicsilicovolcanoconiosis";
+        let mut first: Vec<u32> = Vec::new();
+        let mut second: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(text.as_bytes(), &mut first);
+        tok.encode_with_added_tokens_flat(text.as_bytes(), &mut second);
+        assert_eq!(first, second, "long-cache hit must match the cold miss");
+        assert_eq!(
+            second[11..],
+            [1052, 2638, 2819, 17175, 11314, 6444, 2594, 7352, 26461, 27572, 11261, 6767, 15472, 6761, 8663, 10735, 2483]
+        );
+    }
+
+    /// A fork must encode identically to its parent: the fork reseeds its cache
+    /// from the vocab, and for WordPiece that seed runs through `encode_unit`,
+    /// so a mismatch here would mean the seed and the miss path disagree.
+    #[test]
+    fn bert_fork_matches_parent() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = super::test_util::bert_path("google-bert/bert-base-uncased") else {
+            return;
+        };
+        let mut parent = load_hf_bpe(&path).expect("bert-base-uncased must load");
+        let mut child = parent.fork();
+        let text = "The quick brown fox, unaffable and zzzqqq, jumps over Café!  \
+                    Multiple   spaces\tand\ttabs -- plus 中文 and don't.";
+        let mut want: Vec<u32> = Vec::new();
+        let mut got: Vec<u32> = Vec::new();
+        parent.encode_with_added_tokens_flat(text.as_bytes(), &mut want);
+        child.encode_with_added_tokens_flat(text.as_bytes(), &mut got);
+        assert_eq!(got, want);
+        assert!(!want.is_empty());
+    }
 
     /// `add_special_token` whose content duplicates an existing vocab byte
     /// string must resolve to the added ID everywhere: `vocab_inv`, the
@@ -2446,6 +2804,10 @@ mod tests {
             PretokenizerType::Kimi,
             PretokenizerType::SuperBPEStage1,
             PretokenizerType::SuperwordBounded,
+            // Bert's spans drop whitespace rather than partitioning the input,
+            // so it is the one scheme here where the two paths agreeing also
+            // demonstrates that nothing downstream assumes contiguity.
+            PretokenizerType::Bert,
         ];
         let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();
 
@@ -3541,6 +3903,20 @@ mod walker_edge {
         P: Iterator<Item = Pretoken<'a>>,
     {
         check_partition(span, make(span), scheme);
+        check_scheme_encode_only(tok, span, make, scheme);
+    }
+
+    /// [`check_scheme_encode`] without the partition check, for schemes whose
+    /// spans legitimately do not tile the input (`bert` drops whitespace).
+    fn check_scheme_encode_only<'a, P>(
+        tok: &mut Tokenizer,
+        span: &'a [u8],
+        make: impl Fn(&'a [u8]) -> P,
+        scheme: &str,
+    ) where
+        P: PretokenSpans<'a>,
+        P: Iterator<Item = Pretoken<'a>>,
+    {
         let mut got: Vec<u32> = Vec::new();
         tok.memoized_encode_flat(make(span), &mut got);
         let mut expected: Vec<u32> = Vec::new();
@@ -3564,6 +3940,12 @@ mod walker_edge {
         check_scheme_encode(tok, span, FastQwen35Pretokenizer::new, "qwen3_5");
         check_scheme_encode(tok, span, FastOlmo3Pretokenizer::new, "olmo3");
         check_scheme_encode(tok, span, FastDeepSeekV3Pretokenizer::new, "deepseek_v3");
+        // No partition check: this scheme drops whitespace by design, so its
+        // spans are non-contiguous. The two-path agreement below is still the
+        // property that matters — and on invalid UTF-8 it is the one that
+        // caught the class-table overread that made >65 KB pretokens split
+        // nondeterministically.
+        check_scheme_encode_only(tok, span, FastBertPretokenizer::new, "bert");
     }
 
     /// Truncated multi-byte UTF-8 at the buffer end, every shape: for each

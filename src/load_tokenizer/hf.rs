@@ -54,6 +54,16 @@ struct NormalizerJson {
     /// `Precompiled` normalizer: base64-encoded sentencepiece charsmap.
     #[serde(default)]
     precompiled_charsmap: Option<String>,
+    /// `BertNormalizer` flags. `strip_accents` is a tri-state: `null` means
+    /// "follow `lowercase`", which is not the same as `false`.
+    #[serde(default)]
+    clean_text: Option<bool>,
+    #[serde(default)]
+    handle_chinese_chars: Option<bool>,
+    #[serde(default)]
+    strip_accents: Option<bool>,
+    #[serde(default)]
+    lowercase: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -99,10 +109,21 @@ struct Model {
     #[serde(rename = "type", default = "legacy_bpe_type")]
     model_type: String,
     vocab: HashMap<String, u32>,
-    #[serde(deserialize_with = "deserialize_merges")]
+    /// Absent on WordPiece models, which have no merge list at all.
+    #[serde(default, deserialize_with = "deserialize_merges")]
     merges: Vec<[String; 2]>,
     #[serde(default)]
     byte_fallback: bool,
+    /// WordPiece: the token every failed segmentation collapses to.
+    #[serde(default)]
+    unk_token: Option<String>,
+    /// WordPiece: the prefix marking a non-word-initial piece (`"##"`).
+    #[serde(default)]
+    continuing_subword_prefix: Option<String>,
+    /// WordPiece: word length cap **in chars**, past which the word becomes a
+    /// single unk. Also the untyped-legacy WordPiece marker.
+    #[serde(default)]
+    max_input_chars_per_word: Option<usize>,
     /// HF BPE `ignore_merges`: a pretoken whose whole byte string is a vocab
     /// entry encodes as that single ID, skipping the merge loop (GLM-5.2,
     /// DeepSeek V3, Llama 3).
@@ -204,12 +225,11 @@ pub enum HfTokenizer {
     SentencePiece(SentencePieceBPE),
 }
 
-/// Probes `model.type` alone, so an unsupported model family (WordPiece,
-/// Unigram, ...) is refused by name BEFORE the full BPE-shaped schema is
-/// applied —
-/// those files are valid JSON with a different `model.vocab`/`merges`
-/// shape, and the full parse would report a misleading deserializer error
-/// ("missing field `merges`", "invalid type: sequence, expected a map").
+/// Probes `model.type` alone, so an unsupported model family (Unigram, ...) is
+/// refused by name BEFORE the full BPE-shaped schema is applied — those files
+/// are valid JSON with a different `model.vocab`/`merges` shape, and the full
+/// parse would report a misleading deserializer error ("invalid type: sequence,
+/// expected a map").
 #[derive(Deserialize)]
 struct ModelTypeProbe {
     #[serde(default)]
@@ -223,31 +243,45 @@ struct ModelTypeOnly {
     /// Family markers for untyped legacy files (pre-0.9 `tokenizers`
     /// omitted `model.type`): `unk_id` only exists on Unigram models
     /// (e.g. t5-small, xlm-roberta) and `max_input_chars_per_word` only on
-    /// WordPiece (e.g. bert-base-uncased). `continuing_subword_prefix`
-    /// would NOT work for WordPiece detection: BPE serializes it too (the
-    /// original gpt2 upload has `"continuing_subword_prefix": ""`).
+    /// WordPiece (e.g. bert-base-uncased, whose `model` block has no `type`).
+    /// `continuing_subword_prefix` would NOT work for WordPiece detection:
+    /// BPE serializes it too (the original gpt2 upload has
+    /// `"continuing_subword_prefix": ""`).
     unk_id: Option<u64>,
     max_input_chars_per_word: Option<u64>,
 }
 
+/// Which model family a `tokenizer.json` declares.
+#[derive(PartialEq, Eq, Debug)]
+enum ModelFamily {
+    Bpe,
+    WordPiece,
+}
+
+/// The family, or an error naming an unsupported one. Typed files say so
+/// outright; untyped legacy files are identified by their marker fields.
+fn probe_model_family(data: &[u8]) -> Result<ModelFamily> {
+    let Ok(ModelTypeProbe { model: Some(m) }) = sonic_rs::from_slice::<ModelTypeProbe>(data) else {
+        // No `model` object to probe; let the full parse produce the error.
+        return Ok(ModelFamily::Bpe);
+    };
+    let unsupported = match m.model_type.as_deref() {
+        Some("BPE") => return Ok(ModelFamily::Bpe),
+        Some("WordPiece") => return Ok(ModelFamily::WordPiece),
+        Some(other) => other.to_string(),
+        None if m.unk_id.is_some() => "Unigram (untyped legacy file)".to_string(),
+        None if m.max_input_chars_per_word.is_some() => return Ok(ModelFamily::WordPiece),
+        // Untyped BPE (pre-0.9 GPT-2-style files).
+        None => return Ok(ModelFamily::Bpe),
+    };
+    Err(eyre::eyre!(
+        "Unsupported model type \"{unsupported}\": gigatoken supports BPE tokenizers \
+         (byte-level, or SentencePiece-style with byte_fallback) and WordPiece"
+    ))
+}
+
 fn parse_tokenizer_json(data: &[u8]) -> Result<TokenizerJson> {
-    if let Ok(ModelTypeProbe { model: Some(m) }) = sonic_rs::from_slice::<ModelTypeProbe>(data) {
-        let family = match m.model_type.as_deref() {
-            Some("BPE") => None,
-            Some(other) => Some(other.to_string()),
-            None if m.unk_id.is_some() => Some("Unigram (untyped legacy file)".to_string()),
-            None if m.max_input_chars_per_word.is_some() => {
-                Some("WordPiece (untyped legacy file)".to_string())
-            }
-            None => None, // untyped BPE (pre-0.9 GPT-2-style files)
-        };
-        if let Some(family) = family {
-            return Err(eyre::eyre!(
-                "Unsupported model type \"{family}\": gigatoken supports BPE tokenizers \
-                 (byte-level, or SentencePiece-style with byte_fallback)"
-            ));
-        }
-    }
+    probe_model_family(data)?;
     // Inline the deserializer's own message (offending field, position,
     // snippet): the first line is often all that surfaces in test summaries
     // and short tracebacks.
@@ -264,8 +298,14 @@ fn read_tokenizer_json(path: impl AsRef<Path>) -> Result<TokenizerJson> {
 /// Load a tokenizer from in-memory `tokenizer.json` contents, choosing the
 /// SentencePiece or ByteLevel BPE style from the model's `byte_fallback` flag.
 pub fn load_hf_slice(data: &[u8]) -> Result<HfTokenizer> {
+    let family = probe_model_family(data)?;
     let tj = parse_tokenizer_json(data)?;
-    if tj.model.byte_fallback {
+    // WordPiece rides the `Bpe` arm: `build_wordpiece` returns the same
+    // `Tokenizer` type with its WordPiece model installed, so no enum variant,
+    // no third `batch.rs` function family, and no Python dispatch change.
+    if family == ModelFamily::WordPiece {
+        Ok(HfTokenizer::Bpe(build_wordpiece(&tj)?))
+    } else if tj.model.byte_fallback {
         Ok(HfTokenizer::SentencePiece(build_sentencepiece(&tj)?))
     } else {
         Ok(HfTokenizer::Bpe(build_bpe(&tj)?))
@@ -620,6 +660,14 @@ fn detect_pretokenizer_type(
         // No pre_tokenizer at all; keep the historical default.
         return Ok(PretokenizerType::GPT2);
     };
+    // `BertPreTokenizer` carries no regex at all — it is two hardcoded splits —
+    // so it is identified by kind name, not through `from_split_regexes`.
+    fn has_bert(pt: &PreTokenizerJson) -> bool {
+        pt.kind == "BertPreTokenizer" || pt.pretokenizers.iter().any(has_bert)
+    }
+    if has_bert(pt) {
+        return Ok(PretokenizerType::Bert);
+    }
     let mut regexes = Vec::new();
     collect_split_regexes(pt, &mut regexes);
     if regexes.is_empty() {
@@ -695,8 +743,128 @@ fn unicode_to_bytes(s: &str, u2b: &HashMap<char, u8>) -> Vec<u8> {
 /// byte_fallback (e.g. GPT-2, RoBERTa).
 ///
 /// Returns a [`bpe::tiktoken::Tokenizer`] with byte remapping.
+/// WordPiece files load through here too (they build the same `Tokenizer`), so
+/// one entry point covers every non-byte_fallback `tokenizer.json`.
 pub fn load_hf_bpe(path: impl AsRef<Path>) -> Result<bpe::tiktoken::Tokenizer> {
-    build_bpe(&read_tokenizer_json(path)?)
+    let path = path.as_ref();
+    let data =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    build_bpe_or_wordpiece(&data).with_context(|| format!("Failed to load {}", path.display()))
+}
+
+/// Dispatch on the declared model family, for the entry points that hand back a
+/// [`bpe::tiktoken::Tokenizer`].
+fn build_bpe_or_wordpiece(data: &[u8]) -> Result<bpe::tiktoken::Tokenizer> {
+    let family = probe_model_family(data)?;
+    let tj = parse_tokenizer_json(data)?;
+    match family {
+        ModelFamily::WordPiece => build_wordpiece(&tj),
+        ModelFamily::Bpe => build_bpe(&tj),
+    }
+}
+
+/// Build a WordPiece tokenizer (BERT and family).
+///
+/// Returns the same [`bpe::tiktoken::Tokenizer`] a BPE file does, with the
+/// WordPiece model installed in place of the merge table — so it rides the
+/// existing `HfTokenizer::Bpe` arm, `batch.rs`'s existing worker pool, and the
+/// existing PyO3 class with no dispatch changes anywhere.
+fn build_wordpiece(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
+    use crate::bpe::wordpiece::{DEFAULT_MAX_INPUT_CHARS_PER_WORD, WordPiece};
+
+    let unk_token = tj
+        .model
+        .unk_token
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("WordPiece model without an `unk_token`"))?;
+    let prefix = tj.model.continuing_subword_prefix.as_deref().unwrap_or("##");
+    let max_input_chars = tj
+        .model
+        .max_input_chars_per_word
+        .unwrap_or(DEFAULT_MAX_INPUT_CHARS_PER_WORD);
+
+    // WordPiece vocab strings are literal UTF-8 — no GPT-2 byte-level
+    // remapping, which is also why `ByteRemapping::from_byte_vocab` must not be
+    // called: it requires a single-byte token for every UTF-8-legal byte, and a
+    // WordPiece vocab has no such entries.
+    let max_id = tj.model.vocab.values().max().copied().unwrap_or(0) as usize;
+    let mut vocab: Vec<Arc<[u8]>> = vec![Arc::from(Vec::new().as_slice()); max_id + 1];
+    for (tok_str, &id) in &tj.model.vocab {
+        vocab[id as usize] = tok_str.as_bytes().into();
+    }
+    extend_vocab_with_added_tokens(&mut vocab, &tj.added_tokens);
+
+    let wordpiece = WordPiece::new(
+        tj.model
+            .vocab
+            .iter()
+            .map(|(piece, &id)| (piece.clone(), TokenId::from(id))),
+        unk_token,
+        prefix,
+        max_input_chars,
+    )?;
+
+    let vocab: Vec<Vec<u8>> = vocab.into_iter().map(|a| a.to_vec()).collect();
+    let mut tokenizer = bpe::tiktoken::Tokenizer::new_wordpiece(Arc::new(wordpiece), vocab);
+    tokenizer.set_pretokenizer_type(detect_pretokenizer_type(&tj.pre_tokenizer)?);
+    tokenizer.set_bert_normalizer(parse_bert_normalizer(&tj.normalizer)?.map(Arc::new));
+    tokenizer.set_added_tokens(
+        tj.added_tokens
+            .iter()
+            .map(|t| bpe::tiktoken::AddedTokenDef {
+                content: t.content.as_bytes().into(),
+                id: TokenId::from(t.id),
+                lstrip: t.lstrip,
+                rstrip: t.rstrip,
+            })
+            .collect(),
+    );
+    Ok(tokenizer)
+}
+
+/// Translate a `BertNormalizer` (possibly inside a `Sequence`) into its config.
+/// `None` when the file declares no normalizer at all.
+///
+/// An unrelated normalizer type is an error rather than a silent skip: BERT's
+/// token stream depends on lowercasing and accent stripping, so ignoring a
+/// normalizer we do not model would mis-encode quietly.
+fn parse_bert_normalizer(
+    normalizer: &Option<NormalizerJson>,
+) -> Result<Option<crate::bpe::bert_normalizer::BertNormalizer>> {
+    use crate::bpe::bert_normalizer::BertNormalizer;
+
+    fn find<'a>(n: &'a NormalizerJson) -> Result<Option<&'a NormalizerJson>> {
+        match n.kind.as_str() {
+            "BertNormalizer" => Ok(Some(n)),
+            "Sequence" => {
+                for child in &n.normalizers {
+                    if let Some(found) = find(child)? {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            }
+            other => Err(eyre::eyre!(
+                "Unsupported normalizer type for WordPiece tokenizers: {other}"
+            )),
+        }
+    }
+
+    let Some(n) = normalizer else {
+        return Ok(None);
+    };
+    let Some(bn) = find(n)? else {
+        return Ok(None);
+    };
+    let norm = BertNormalizer::new(
+        bn.clean_text.unwrap_or(true),
+        bn.handle_chinese_chars.unwrap_or(true),
+        // `null` is not "false": HF resolves it to the `lowercase` flag, which
+        // is how bert-base-uncased strips accents without saying so.
+        bn.strip_accents,
+        bn.lowercase.unwrap_or(true),
+    );
+    Ok((!norm.is_noop()).then_some(norm))
 }
 
 fn build_bpe(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
@@ -824,26 +992,104 @@ mod tests {
         assert_eq!(tj.model.model_type, "BPE");
     }
 
+    /// WordPiece must be recognised both when typed and — as in
+    /// `bert-base-uncased`, whose `model` block has **no** `type` field — from
+    /// the `max_input_chars_per_word` marker alone. `continuing_subword_prefix`
+    /// must NOT be the discriminator: BPE serializes it too.
+    #[test]
+    fn test_wordpiece_family_is_detected() {
+        // Three hashes: the JSON contains `"##`, which would close both a
+        // `br#"` and a `br##"` raw string.
+        let typed = br###"{"model": {"type": "WordPiece", "unk_token": "[UNK]",
+            "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+            "vocab": {"[UNK]": 0, "hello": 1}}}"###;
+        let untyped: &[u8] = b"{\"model\": {\"unk_token\": \"[UNK]\",
+            \"continuing_subword_prefix\": \"##\", \"max_input_chars_per_word\": 100,
+            \"vocab\": {\"[UNK]\": 0}}}";
+        for json in [&typed[..], untyped] {
+            assert_eq!(probe_model_family(json).unwrap(), ModelFamily::WordPiece);
+        }
+        // A BPE file that happens to carry `continuing_subword_prefix` (the
+        // original gpt2 upload does) stays BPE.
+        let gpt2ish = br#"{"model": {"vocab": {"a": 0}, "merges": [],
+            "continuing_subword_prefix": ""}}"#;
+        assert_eq!(probe_model_family(gpt2ish).unwrap(), ModelFamily::Bpe);
+    }
+
+    /// A minimal WordPiece file must load and encode through the whole
+    /// pipeline: BertNormalizer → bert pretokenizer → MaxMatch.
+    #[test]
+    fn test_build_wordpiece_end_to_end() {
+        let json = br###"{
+            "normalizer": {"type": "BertNormalizer", "clean_text": true,
+                "handle_chinese_chars": true, "strip_accents": null, "lowercase": true},
+            "pre_tokenizer": {"type": "BertPreTokenizer"},
+            "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+                "vocab": {"[UNK]": 0, "un": 1, "##aff": 2, "##able": 3, "cafe": 4,
+                          "!": 5, "hello": 6}}
+        }"###;
+        let mut tok = build_bpe_or_wordpiece(json).expect("WordPiece must load");
+        assert_eq!(tok.pretokenizer_type(), crate::pretokenize::PretokenizerType::Bert);
+        assert!(tok.wordpiece().is_some());
+
+        let mut ids = Vec::new();
+        // "Unaffable" lowercases; "Café" strips its accent; "!" isolates;
+        // "zzz" is unknown and collapses to one [UNK].
+        tok.encode_with_added_tokens_flat("Unaffable Café! zzz".as_bytes(), &mut ids);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 0]);
+
+        // Decode is the HF WordPiece decoder, not a byte concatenation.
+        let tokens: Vec<TokenId> = ids.iter().map(|&i| TokenId::from(i)).collect();
+        assert_eq!(
+            tok.decode_wordpiece(&tokens, true).unwrap(),
+            "unaffable cafe! [UNK]"
+        );
+    }
+
+    /// A WordPiece vocab has no single-byte tokens, so the byte-level remapping
+    /// must never be attempted — and the cache seed must agree with the miss
+    /// path, which is what a wrong seed would break silently.
+    #[test]
+    fn test_wordpiece_seed_matches_miss_path() {
+        let json = br###"{
+            "pre_tokenizer": {"type": "BertPreTokenizer"},
+            "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+                "vocab": {"[UNK]": 0, "ab": 1, "##cd": 2, "abcd": 3, "x": 4}}
+        }"###;
+        let mut tok = build_bpe_or_wordpiece(json).unwrap();
+        // "abcd" is a whole vocab word AND decomposable as ab+##cd. MaxMatch is
+        // longest-first, so it must be the single ID 3 — and that is exactly
+        // what the vocab seed put in the cache, so the seeded hit and a cold
+        // miss cannot disagree.
+        let mut ids = Vec::new();
+        tok.encode_with_added_tokens_flat(b"abcd", &mut ids);
+        assert_eq!(ids, vec![3]);
+
+        let mut fresh = build_bpe_or_wordpiece(json).unwrap();
+        let mut ids2 = Vec::new();
+        // A pretoken absent from the vocab takes the true miss path.
+        fresh.encode_with_added_tokens_flat(b"abcdx", &mut ids2);
+        assert_eq!(ids2, vec![0], "abcdx has no ##x, so the whole word is UNK");
+    }
+
     /// Unsupported model families must be refused by name, not with the
-    /// deserializer's shape error for the BPE schema (WordPiece has no
-    /// `merges`; Unigram's vocab is a `[piece, score]` list, not a map).
+    /// deserializer's shape error for the BPE schema (Unigram's vocab is a
+    /// `[piece, score]` list, not a map).
+    ///
+    /// WordPiece used to be in this list and is now supported, so the rows for
+    /// it moved to [`test_wordpiece_family_is_detected`].
     #[test]
     fn test_unsupported_model_type_named_in_error() {
-        let wordpiece = br#"{"model": {"type": "WordPiece", "unk_token": "[UNK]",
-            "vocab": {"[UNK]": 0, "hello": 1}}}"#;
         let unigram = br#"{"model": {"type": "Unigram", "unk_id": 0,
             "vocab": [["<unk>", 0.0], ["hello", -3.1]]}}"#;
         // Pre-0.9 tokenizers files omit model.type; the family is inferred
-        // from its marker fields (t5-small / bert-base-uncased shapes).
+        // from its marker fields (the t5-small shape).
         let untyped_unigram = br#"{"model": {"unk_id": 0, "vocab": [["<unk>", 0.0]]}}"#;
-        let untyped_wordpiece: &[u8] = b"{\"model\": {\"unk_token\": \"[UNK]\",
-            \"continuing_subword_prefix\": \"##\", \"max_input_chars_per_word\": 100,
-            \"vocab\": {\"[UNK]\": 0}}}";
         for (json, name) in [
-            (&wordpiece[..], "WordPiece"),
             (&unigram[..], "Unigram"),
             (&untyped_unigram[..], "Unigram (untyped legacy file)"),
-            (&untyped_wordpiece[..], "WordPiece (untyped legacy file)"),
         ] {
             let err = match parse_tokenizer_json(json) {
                 Ok(_) => panic!("expected {name} to be refused"),

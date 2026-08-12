@@ -26,11 +26,15 @@ mod options;
 mod pretoken;
 pub(crate) mod pretokenize_traits;
 pub mod reference;
-mod unicode;
+// `pub(crate)`, not private: `bpe::bert_normalizer` classifies codepoints with
+// the same tables the `bert` pretokenizer scheme uses, and both halves of
+// `BertNormalizer` (clean_text's remove/space sets, strip_accents' Mn set) live
+// in one packed table so a char costs one load in either consumer.
+pub(crate) mod unicode;
 
 pub use fast::{
-    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
-    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    FastBertPretokenizer, FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer,
+    FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 pub use options::{FastPretokenizerDispatch, PretokenizerType};
 pub use reference::state_machine::PretokenizerIter;
@@ -1008,6 +1012,11 @@ mod span_source_tests {
             crate::pretokenize::fast::FastSuperwordBoundedPretokenizer::new(b),
             "superword_bounded",
         );
+        check_source(
+            crate::pretokenize::fast::FastBertPretokenizer::new(b),
+            crate::pretokenize::fast::FastBertPretokenizer::new(b),
+            "bert",
+        );
     }
 
     /// Every scheme's chunked `fill_spans_keyed` must reproduce its
@@ -1054,6 +1063,7 @@ mod span_source_tests {
                 PretokenizerType::Kimi,
                 PretokenizerType::SuperBPEStage1,
                 PretokenizerType::SuperwordBounded,
+                PretokenizerType::Bert,
             ] {
                 check_source(pt.pretokenize(b), pt.pretokenize(b), "dispatch");
             }

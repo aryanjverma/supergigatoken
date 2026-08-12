@@ -1,7 +1,9 @@
+pub mod bert_normalizer;
 pub(crate) mod pretoken_cache;
 pub mod sentencepiece;
 pub(crate) mod superword;
 pub mod tiktoken;
+pub mod wordpiece;
 
 /// Ask the kernel for 2 MiB pages over `[ptr, ptr + bytes)` before first
 /// touch. Huge pages cut the fault count of faulting in a multi-GB buffer

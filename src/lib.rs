@@ -247,9 +247,21 @@ impl BPETokenizer {
         merges_to_pylist(py, self.tokenizer.merge_entries())
     }
 
+    /// Decode token IDs back to bytes.
+    ///
+    /// A WordPiece tokenizer decodes through HF's `WordPiece` decoder (join
+    /// with spaces, splice out ` ##`, tidy the spacing) rather than
+    /// concatenating vocab bytes: its pretokenizer drops whitespace, so a
+    /// concatenation would run every word together. That also means decode is
+    /// **not** the inverse of encode for WordPiece — the original spacing and
+    /// casing are gone — which is true of HF as well.
     fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         let ids = extract_token_ids(&tokens)?;
-        Ok(self.tokenizer.decode(ids.as_slice()?).collect())
+        let ids = ids.as_slice()?;
+        if let Some(text) = self.tokenizer.decode_wordpiece(ids, true) {
+            return Ok(text.into_bytes());
+        }
+        Ok(self.tokenizer.decode(ids).collect())
     }
 
     fn __repr__(&self) -> PyResult<String> {

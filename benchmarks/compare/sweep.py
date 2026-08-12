@@ -72,6 +72,9 @@ REPOS = [
     "tencent/Hy3",
     "microsoft/phi-4",
     "microsoft/Phi-4-mini-instruct",
+    # WordPiece families
+    "google-bert/bert-base-uncased",
+    "bert-base-multilingual-cased",
     # SentencePiece families
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "codellama/CodeLlama-7b-hf",
