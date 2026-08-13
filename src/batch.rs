@@ -1289,6 +1289,92 @@ mod tests {
         }
     }
 
+    /// WordPiece must survive fragmenting too. `can_fragment` admits the `bert`
+    /// scheme — correctly, but for reasons that are not the byte-level ones and
+    /// were untested until this test existed:
+    ///
+    /// - `safe_split_ranges` cuts on a space, and whitespace is a *hard*
+    ///   boundary for `BertPreTokenizer` (it splits there and drops the
+    ///   delimiter), so no cut can land inside a pretoken. The continuation
+    ///   fragment opens with the space, which the walker skips.
+    /// - The `BertNormalizer` runs per fragment rather than per document, and
+    ///   that is only equivalent because a cut sits on a space: `clean_text`,
+    ///   `handle_chinese_chars` and the case fold are per character, and NFD
+    ///   never decomposes or reorders across a starter — which U+0020 is. Cut
+    ///   anywhere *inside* a combining sequence and the two halves would
+    ///   normalize differently.
+    ///
+    /// The text below is chosen to make a mis-placed cut visible: combining
+    /// marks that `strip_accents` removes, CJK that the normalizer pads with
+    /// spaces (so the pretoken split depends on normalizer output, not input),
+    /// long words that MaxMatch splits into several continuation pieces, and
+    /// words that collapse to a whole-word `[UNK]`.
+    #[test]
+    fn wordpiece_parallel_fragmented_matches_serial() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let Some(path) = crate::test_hub::hf_tokenizer_json("google-bert/bert-base-uncased") else {
+            eprintln!("SKIP: google-bert/bert-base-uncased is not in the HF cache");
+            return;
+        };
+        let proto = load_hf_bpe(&path).expect("bert-base-uncased must load");
+        assert!(proto.wordpiece().is_some(), "must be the WordPiece path");
+        assert!(can_fragment(&proto), "the bert scheme must be fragmentable");
+        let added = proto.added_token_split_blockers();
+
+        let block = concat!(
+            "The Quick Brown Fox jumps over the lazy dog again and again today\n",
+            "Cafe\u{301} naive\u{308} combining marks that strip_accents deletes entirely\n",
+            "supercalifragilisticexpialidocious pneumonoultramicroscopicsilicovolcanoconiosis x\n",
+            "\u{4e2d}\u{6587}\u{6587}\u{5b57} CJK padded by the normalizer into its own pretokens ok\n",
+            "zzzqqq unknowable\u{378}word collapses to one UNK and then continues on\n",
+            "don't isn't we'll punctuation!!! ...ellipsis??? (parens) [brackets] end\n",
+            "tabs\there and   runs    of  spaces   before words resume normally x\n",
+            "[SEP] and [CLS] as added tokens matched atomically in the raw input\n",
+        );
+        let mut big = String::new();
+        while big.len() < (6 << 20) {
+            big.push_str(block);
+        }
+        let docs: Vec<&[u8]> = vec![
+            block.as_bytes(),
+            big.as_bytes(),
+            b"",
+            block.as_bytes(),
+            b"tail doc [SEP]",
+        ];
+        let total: usize = docs.iter().map(|d| d.len()).sum();
+
+        let mut ids_ref: Vec<u32> = Vec::new();
+        let mut lens_ref: Vec<i64> = Vec::new();
+        let mut serial = proto.fork();
+        for doc in &docs {
+            encode_into(&mut serial, doc, &mut ids_ref, &mut lens_ref);
+        }
+        drop(serial);
+
+        for lpt in [true, false] {
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_docs_ragged_with(&workers, &proto, &docs, lpt);
+            assert_eq!(lens, lens_ref, "lens mismatch (default target, lpt={lpt})");
+            assert_ids_match(&format!("wordpiece default target, lpt={lpt}"), &flat, &ids_ref);
+
+            // A small explicit target forces a cut every few hundred bytes.
+            let chunks = build_doc_chunks(&docs, total, 16 << 10, &added, lpt, can_fragment(&proto));
+            let fragments = chunks
+                .iter()
+                .filter(|c| matches!(c, EncodeChunk::Fragment { .. }))
+                .count();
+            assert!(
+                fragments > 100,
+                "expected many fragments (lpt={lpt}), got {fragments}"
+            );
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_chunks_gathered(&workers, &proto, &chunks, total);
+            assert_eq!(lens, lens_ref, "lens mismatch (small target, lpt={lpt})");
+            assert_ids_match(&format!("wordpiece small target, lpt={lpt}"), &flat, &ids_ref);
+        }
+    }
+
     /// `ByteLevel(add_prefix_space=true)` (RoBERTa-style exports) must
     /// survive fragmenting, for a reason that is split across two files.
     ///
