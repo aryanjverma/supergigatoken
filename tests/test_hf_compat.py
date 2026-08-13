@@ -500,3 +500,89 @@ def test_as_hf_unavailable_without_hf_config(r50k_tiktoken_path):
     tok = gigatoken.Tokenizer.from_tiktoken(r50k_tiktoken_path)
     with pytest.raises(ValueError, match="tokenizer.json"):
         tok.as_hf()
+
+
+# ---------------------------------------------------------------------------
+# WordPiece / BERT through the compat adapter
+# ---------------------------------------------------------------------------
+#
+# These pin a boundary that is easy to mistake for a bug. What `as_hf()` can
+# report depends on what its *source* carried:
+#
+#   bare tokenizer.json  -> no pad_token, no token_type_ids, empty specials
+#   transformers object  -> everything, because that object already resolved
+#                           them from its architecture's class defaults
+#
+# BERT is where the difference is visible, because [PAD]/[CLS]/[SEP] and
+# token_type_ids are exactly what a BERT caller reaches for. Neither
+# tokenizer.json nor tokenizer_config.json contains them (the latter holds only
+# do_lower_case and model_max_length); transformers takes them from
+# BertTokenizerFast's class attributes after resolving config.json. So the
+# bare-json arm is not a gap in gigatoken — it is the same thing transformers
+# itself reports from the same input, and the tests below assert that rather
+# than leaving it to memory.
+
+
+def test_bert_as_hf_matches_transformers_bare_json(bert_base_uncased_tokenizer_path):
+    """From a bare tokenizer.json, `as_hf()` must agree with transformers'
+    own bare loader — including on what is *absent*."""
+    from transformers import PreTrainedTokenizerFast
+
+    bare = PreTrainedTokenizerFast(tokenizer_file=str(bert_base_uncased_tokenizer_path))
+    compat = gigatoken.Tokenizer(bert_base_uncased_tokenizer_path).as_hf()
+
+    for text in TEXTS + ["Unaffable Cafe!", "don't stop"]:
+        assert compat.encode(text) == bare.encode(text), text
+        assert compat.encode(text, add_special_tokens=False) == bare.encode(text, add_special_tokens=False), text
+
+    ids = bare.encode("Unaffable Cafe!")
+    # [CLS] ... [SEP] wrapping is on by default, as in transformers.
+    assert ids[0] == 101 and ids[-1] == 102
+    # transformers' decode default is skip_special_tokens=False (unlike the
+    # `tokenizers` library's, which is True) — so the wrapper shows through.
+    assert compat.decode(ids) == bare.decode(ids)
+    assert compat.decode(ids, skip_special_tokens=True) == bare.decode(ids, skip_special_tokens=True)
+
+    assert sorted(compat("Hello, world!").keys()) == sorted(bare("Hello, world!").keys())
+    assert compat.model_input_names == bare.model_input_names
+    assert sorted(compat.all_special_tokens) == sorted(bare.all_special_tokens)
+    assert compat.pad_token_id == bare.pad_token_id  # both None
+    # And both refuse to pad for the same reason.
+    with pytest.raises(ValueError, match="pad"):
+        compat(["a", "bb ccc"], padding=True)
+
+
+def test_bert_as_hf_matches_auto_tokenizer(bert_hub_dir):
+    """Handed a transformers tokenizer, `as_hf()` must match AutoTokenizer
+    outright — the path that carries pad_token and the special-token set."""
+    from transformers import AutoTokenizer
+
+    auto = AutoTokenizer.from_pretrained(str(bert_hub_dir))
+    compat = gigatoken.Tokenizer(auto).as_hf()
+
+    assert compat.pad_token == auto.pad_token == "[PAD]"
+    assert compat.pad_token_id == auto.pad_token_id == 0
+    assert sorted(compat.all_special_tokens) == sorted(auto.all_special_tokens)
+    assert compat.cls_token_id == auto.cls_token_id
+    assert compat.sep_token_id == auto.sep_token_id
+
+    for text in TEXTS + ["Unaffable Cafe!", "zzzqqq"]:
+        assert compat.encode(text) == auto.encode(text), text
+        ids = auto.encode(text)
+        assert compat.decode(ids) == auto.decode(ids), text
+
+    # Padding now works, and matches — including the pad id and mask.
+    got = compat(["a", "bb ccc", "The quick brown fox."], padding=True)
+    want = auto(["a", "bb ccc", "The quick brown fox."], padding=True)
+    assert got["input_ids"] == want["input_ids"]
+    assert got["attention_mask"] == want["attention_mask"]
+
+
+def test_bert_native_decode_is_the_wordpiece_decoder(bert_base_uncased_tokenizer_path):
+    """The native (non-compat) decode must use HF's WordPiece decoder rather
+    than concatenating vocab bytes, which would run every word together."""
+    tok = gigatoken.Tokenizer(bert_base_uncased_tokenizer_path)
+    hf = HFTokenizer.from_file(str(bert_base_uncased_tokenizer_path))
+    for text in ["Unaffable Cafe!", "The quick brown fox jumps.", "don't stop"]:
+        ids = hf.encode(text, add_special_tokens=False).ids
+        assert tok.decode(ids) == hf.decode(ids, skip_special_tokens=False).encode("utf-8"), text

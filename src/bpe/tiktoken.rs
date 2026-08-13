@@ -16,7 +16,7 @@ use crate::pretokenize::{
     pack_pretoken_key, pretoken_key_hash,
 };
 use crate::bpe::bert_normalizer::{BertNormalizer, BertScratch};
-use crate::bpe::wordpiece::WordPiece;
+use crate::bpe::wordpiece::{WordPiece, WordPieceDecoder};
 use crate::token::TokenId;
 use eyre::Result;
 use std::collections::HashMap;
@@ -100,9 +100,20 @@ pub struct Tokenizer {
     /// like `merges`/`vocab`. Mutually exclusive with `merges` being
     /// meaningful: a WordPiece model has no merge list.
     wordpiece: Option<Arc<WordPiece>>,
+    /// The `decoder` block's WordPiece config, when the file declares one.
+    /// `None` means "join with spaces and stop", which is what HF does for a
+    /// WordPiece file with no decoder — see [`WordPieceDecoder`].
+    wordpiece_decoder: Option<Arc<WordPieceDecoder>>,
     /// HF `BertNormalizer`, applied to each added-token-delimited segment in
     /// [`Self::for_each_piece`] before pretokenization — HF's own order.
     normalizer: Option<Arc<BertNormalizer>>,
+    /// Normalizer scratch, owned here rather than created per call: its buffers
+    /// grow to segment size, and a segment is a whole document on the batch
+    /// path, so a per-call `BertScratch` re-allocated and re-grew megabytes for
+    /// every document. `for_each_piece` `mem::take`s it for the duration of the
+    /// walk (the piece callback holds `&mut Self`, so it cannot be borrowed out
+    /// of `self` across it) and puts it back, keeping the capacity.
+    bert_scratch: BertScratch,
     /// Two-level encode plan for SuperBPE tokenizers, installed by
     /// [`Self::enable_superword_two_level`] and `None` for everything else.
     /// When set, segments take [`Self::superword_encode_segment`] instead of
@@ -451,7 +462,9 @@ impl Tokenizer {
             add_prefix_space: false,
             ignore_merges: false,
             wordpiece,
+            wordpiece_decoder: None,
             normalizer: None,
+            bert_scratch: BertScratch::default(),
             superword: None,
         }
     }
@@ -845,6 +858,9 @@ impl Tokenizer {
             ignore_merges: self.ignore_merges,
             // Both are immutable model data; a fork shares one copy.
             wordpiece: self.wordpiece.clone(),
+            wordpiece_decoder: self.wordpiece_decoder.clone(),
+            // Scratch, not state: a fork starts with empty buffers.
+            bert_scratch: BertScratch::default(),
             normalizer: self.normalizer.clone(),
             // The level-1 tokenizer carries the bulk of a superword
             // encode's cache traffic, so a worker's fork gets its own,
@@ -1214,7 +1230,8 @@ impl Tokenizer {
         // across the `f(self, ...)` call below, like `normalize_nfc`.
         let bert = self.normalizer.clone();
         let mut nfc_buf = String::new();
-        let mut bert_scratch = BertScratch::default();
+        // Taken, not created: see the field's docs. Restored after the walk.
+        let mut bert_scratch = std::mem::take(&mut self.bert_scratch);
         let mut prefix_buf = Vec::new();
         let mut pos = 0;
         while pos < bytes.len() {
@@ -1258,6 +1275,8 @@ impl Tokenizer {
                 None => break,
             }
         }
+        // Hand the buffers back with their capacity, for the next document.
+        self.bert_scratch = bert_scratch;
     }
 
     /// Encode raw text: split out added-token occurrences (emitted as their
@@ -1912,20 +1931,25 @@ impl Tokenizer {
             .copied()
     }
 
-    /// Decode a WordPiece token stream the way HF's `WordPiece` decoder does:
-    /// join the pieces with spaces, then splice out every ` <prefix>` so
-    /// continuation pieces rejoin their word.
+    /// Decode a WordPiece token stream the way HF does: join the pieces with
+    /// spaces, and — when the file declares a `WordPiece` decoder — splice out
+    /// every ` <prefix>` so continuation pieces rejoin their word, then apply
+    /// `cleanup` if it asks for it.
     ///
     /// This cannot be an inverse of encoding — the pretokenizer *drops*
     /// whitespace, so the original spacing is not recoverable — which is why HF
-    /// ships a decoder that re-inserts spaces heuristically. `cleanup` (on by
-    /// default in every BERT export) additionally tidies the spacing HF's own
-    /// detokenizer would leave around punctuation and English contractions.
+    /// ships a decoder that re-inserts spacing heuristically.
+    ///
+    /// The splice and the tidy are **both** conditional on the declared decoder,
+    /// not defaults: a WordPiece file with no `decoder` block decodes to
+    /// `"ab ##cd hello ."`, keeping its markers (see [`WordPieceDecoder`] for the
+    /// measured table). Hardcoding them was wrong for such a file and for any
+    /// file setting `cleanup: false`.
     ///
     /// Returns `None` for a tokenizer with no WordPiece model, so callers keep
     /// using [`Self::decode`] for byte-level vocabularies.
-    pub fn decode_wordpiece(&self, v: &[TokenId], cleanup: bool) -> Option<String> {
-        let prefix = self.wordpiece.as_ref()?.prefix();
+    pub fn decode_wordpiece(&self, v: &[TokenId]) -> Option<String> {
+        self.wordpiece.as_ref()?;
         let mut out = String::new();
         for (i, &token) in v.iter().enumerate() {
             let piece = String::from_utf8_lossy(self.vocab[token.0 as usize].as_ref());
@@ -1934,11 +1958,21 @@ impl Tokenizer {
             }
             out.push_str(&piece);
         }
-        if !prefix.is_empty() {
-            let joined = format!(" {prefix}");
+        let Some(dec) = self.wordpiece_decoder.as_deref() else {
+            // No decoder block: HF joins with spaces and stops there.
+            return Some(out);
+        };
+        if !dec.prefix.is_empty() {
+            let joined = format!(" {}", dec.prefix);
             out = out.replace(&joined, "");
         }
-        Some(if cleanup { wordpiece_cleanup(&out) } else { out })
+        Some(if dec.cleanup { wordpiece_cleanup(&out) } else { out })
+    }
+
+    /// Install the `decoder` block's WordPiece config. Loader-phase mutator,
+    /// like every other `Tokenizer` mutation.
+    pub fn set_wordpiece_decoder(&mut self, decoder: Option<Arc<WordPieceDecoder>>) {
+        self.wordpiece_decoder = decoder;
     }
 
     /// Install HF's `BertNormalizer`. Loader-phase mutator, like every other
@@ -3130,6 +3164,94 @@ mod verify_heavy {
         let (input, mbytes, rounds) = superbpe_bench_corpus();
         let docs = split_docs(&input, b"<|endoftext|>");
         phase_split(&path, &docs, mbytes, rounds);
+    }
+
+    /// Where BERT encode time actually goes, decided in one process because
+    /// this box has background load that moves absolute throughput by ~25%
+    /// between sessions while leaving ratios inside a run intact.
+    ///
+    /// Four arms over the same slice: full encode, normalizer only,
+    /// pretokenizer only (span walk, no cache probe), and the two composed. What
+    /// it decides is whether the scalar `bert` walker is worth a SIMD
+    /// `MaskScheme` port — arithmetic across two *separate* benches suggested
+    /// ~45%, which is exactly the kind of cross-process inference this arm
+    /// exists to replace.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bench_bert_phases -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_bert_phases() {
+        use crate::bpe::bert_normalizer::BertScratch;
+        use crate::pretokenize::FastBertPretokenizer;
+
+        let Some(path) = super::test_util::bert_path("google-bert/bert-base-uncased") else {
+            return;
+        };
+        let (input, mbytes, rounds) = superbpe_bench_corpus();
+        let docs = split_docs(&input, b"<|endoftext|>");
+        let mut tok = load_hf_bpe(&path).expect("bert-base-uncased must load");
+        let normalizer = tok.normalizer.clone().expect("bert-base-uncased has a normalizer");
+
+        // Generic, not boxed: a `Box<dyn FnMut()>` forces every captured buffer
+        // to outlive the call, which the per-arm scratch does not.
+        fn best_of(label: &str, rounds: usize, mbytes: f64, mut arm: impl FnMut()) -> f64 {
+            let mut best = 0.0f64;
+            for _ in 0..rounds {
+                let start = std::time::Instant::now();
+                arm();
+                best = best.max(mbytes / start.elapsed().as_secs_f64());
+            }
+            eprintln!("  {label:34} {best:8.1} MB/s");
+            best
+        }
+
+        eprintln!("bert phase split: {mbytes:.1} MB, {} docs, min-of-{rounds}", docs.len());
+        let mut out: Vec<u32> = Vec::new();
+        let full = best_of("full encode", rounds, mbytes, || {
+            out.clear();
+            for doc in &docs {
+                tok.encode_with_added_tokens_flat(doc, &mut out);
+            }
+            std::hint::black_box(out.len());
+        });
+
+        // Normalizer alone, on raw documents — the same input the real path
+        // hands it.
+        let mut scratch = BertScratch::default();
+        let mut sink = 0usize;
+        let norm_only = best_of("normalize only", rounds, mbytes, || {
+            for doc in &docs {
+                sink += normalizer.normalize(doc, &mut scratch).len();
+            }
+            std::hint::black_box(sink);
+        });
+
+        // Pretokenizer alone, on *normalized* text, because that is what it sees
+        // in the real path — feeding it raw text would measure a different
+        // distribution (more control chars, more non-ASCII).
+        let normalized: Vec<Vec<u8>> = docs
+            .iter()
+            .map(|d| normalizer.normalize(d, &mut scratch).to_vec())
+            .collect();
+        let mut spans = 0usize;
+        let pretok_only = best_of("pretokenize only (normalized)", rounds, mbytes, || {
+            for doc in &normalized {
+                spans += FastBertPretokenizer::new(doc).count();
+            }
+            std::hint::black_box(spans);
+        });
+
+        // Shares are computed on time-per-byte, which is what composes; a
+        // throughput ratio does not.
+        let share = |arm: f64| (full / arm) * 100.0;
+        eprintln!(
+            "  => normalize {:.1}% of encode, pretokenize {:.1}%, everything else {:.1}%",
+            share(norm_only),
+            share(pretok_only),
+            100.0 - share(norm_only) - share(pretok_only),
+        );
+        assert!(full > 0.0 && norm_only > 0.0 && pretok_only > 0.0);
     }
 
     /// Shared body of the phase-split benches. One resident tokenizer, three

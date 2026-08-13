@@ -156,6 +156,23 @@ def bert_base_uncased_tokenizer_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def bert_hub_dir(bert_base_uncased_tokenizer_path) -> Path:
+    """bert-base-uncased snapshot directory with everything AutoTokenizer needs,
+    prefetched and pinned to the cached tokenizer.json's revision, so
+    transformers only ever reads locally (mirrors `gpt2_hub_dir`).
+
+    Needed because the special tokens and `token_type_ids` that
+    AutoTokenizer reports for BERT come from neither tokenizer.json nor
+    tokenizer_config.json (which holds only do_lower_case and
+    model_max_length) — transformers resolves the architecture from config.json
+    and takes them from BertTokenizerFast's class defaults."""
+    snapshot = bert_base_uncased_tokenizer_path.parent
+    for name in ("tokenizer_config.json", "config.json", "vocab.txt"):
+        _hf_file("google-bert/bert-base-uncased", name, revision=snapshot.name)
+    return snapshot
+
+
+@pytest.fixture(scope="session")
 def bert_base_cased_tokenizer_path() -> Path:
     """Path to bert-base-cased tokenizer.json in the HF cache.
 

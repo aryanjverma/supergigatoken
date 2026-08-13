@@ -30,6 +30,25 @@ struct TokenizerJson {
     pre_tokenizer: Option<PreTokenizerJson>,
     #[serde(default)]
     normalizer: Option<NormalizerJson>,
+    #[serde(default)]
+    decoder: Option<DecoderJson>,
+}
+
+/// The `decoder` block. Only the `WordPiece` shape is modelled: the byte-level
+/// decoders describe an inverse the byte-level path already performs by
+/// construction, and a WordPiece file's decoder is the only one whose absence
+/// or settings change the decoded string (see
+/// [`crate::bpe::wordpiece::WordPieceDecoder`]).
+#[derive(Deserialize)]
+struct DecoderJson {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    decoders: Vec<DecoderJson>,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    cleanup: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -847,6 +866,7 @@ fn build_wordpiece(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
     let mut tokenizer = bpe::tiktoken::Tokenizer::new_wordpiece(Arc::new(wordpiece), vocab);
     tokenizer.set_pretokenizer_type(detect_pretokenizer_type(&tj.pre_tokenizer)?);
     tokenizer.set_bert_normalizer(parse_bert_normalizer(&tj.normalizer)?.map(Arc::new));
+    tokenizer.set_wordpiece_decoder(parse_wordpiece_decoder(&tj.decoder).map(Arc::new));
     tokenizer.set_added_tokens(
         tj.added_tokens
             .iter()
@@ -859,6 +879,32 @@ fn build_wordpiece(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
             .collect(),
     );
     Ok(tokenizer)
+}
+
+/// The `WordPiece` decoder config, or `None` when the file declares no decoder
+/// (or one of another kind — a `Sequence` is searched for a `WordPiece` member).
+///
+/// `None` is meaningful rather than a fallback: HF decodes a WordPiece file with
+/// no decoder by joining pieces with spaces and leaving the `##` markers in
+/// place. Defaulting to "splice and clean up" was wrong for such a file, and for
+/// any file that sets `cleanup: false`.
+fn parse_wordpiece_decoder(
+    decoder: &Option<DecoderJson>,
+) -> Option<crate::bpe::wordpiece::WordPieceDecoder> {
+    fn find(d: &DecoderJson) -> Option<&DecoderJson> {
+        match d.kind.as_str() {
+            "WordPiece" => Some(d),
+            "Sequence" => d.decoders.iter().find_map(find),
+            _ => None,
+        }
+    }
+    let d = find(decoder.as_ref()?)?;
+    Some(crate::bpe::wordpiece::WordPieceDecoder {
+        // HF's own defaults for the two fields, applied only once we know a
+        // WordPiece decoder is present.
+        prefix: d.prefix.as_deref().unwrap_or("##").into(),
+        cleanup: d.cleanup.unwrap_or(true),
+    })
 }
 
 /// Translate a `BertNormalizer` (possibly inside a `Sequence`) into its config.
@@ -1078,11 +1124,62 @@ mod tests {
         tok.encode_with_added_tokens_flat("Unaffable Café! zzz".as_bytes(), &mut ids);
         assert_eq!(ids, vec![1, 2, 3, 4, 5, 0]);
 
-        // Decode is the HF WordPiece decoder, not a byte concatenation.
+        // Decode is HF's, not a byte concatenation — and this file declares no
+        // `decoder`, so HF joins with spaces and keeps the `##` markers. The
+        // splice and the cleanup are the decoder's doing, not defaults.
         let tokens: Vec<TokenId> = ids.iter().map(|&i| TokenId::from(i)).collect();
         assert_eq!(
-            tok.decode_wordpiece(&tokens, true).unwrap(),
-            "unaffable cafe! [UNK]"
+            tok.decode_wordpiece(&tokens).unwrap(),
+            "un ##aff ##able cafe ! [UNK]"
+        );
+    }
+
+    /// The `decoder` block drives both the ` ##` splice and the `cleanup` tidy;
+    /// each combination decodes differently. Every expectation measured against
+    /// `tokenizers` 0.22.2 (see `WordPieceDecoder`'s table).
+    #[test]
+    fn test_wordpiece_decoder_block_is_honored() {
+        let with_decoder = |decoder: &str| {
+            let json = format!(
+                r###"{{
+                    "pre_tokenizer": {{"type": "BertPreTokenizer"}},
+                    {decoder}
+                    "model": {{"type": "WordPiece", "unk_token": "[UNK]",
+                        "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+                        "vocab": {{"[UNK]": 0, "ab": 1, "##cd": 2, "hello": 3, ".": 4}}}}
+                }}"###
+            );
+            let tok = build_bpe_or_wordpiece(json.as_bytes()).expect("must load");
+            let ids: Vec<TokenId> = [1u32, 2, 3, 4].iter().map(|&i| TokenId::from(i)).collect();
+            tok.decode_wordpiece(&ids).unwrap()
+        };
+
+        assert_eq!(with_decoder(""), "ab ##cd hello .", "no decoder: space join only");
+        assert_eq!(
+            with_decoder(r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},"###),
+            "abcd hello."
+        );
+        assert_eq!(
+            with_decoder(r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false},"###),
+            "abcd hello ."
+        );
+        // HF's own defaults when the fields are omitted from a present block.
+        assert_eq!(
+            with_decoder(r#""decoder": {"type": "WordPiece"},"#),
+            "abcd hello."
+        );
+        // A decoder of another kind is not a WordPiece decoder.
+        assert_eq!(
+            with_decoder(r#""decoder": {"type": "ByteLevel"},"#),
+            "ab ##cd hello ."
+        );
+        // ... but one nested in a Sequence is found.
+        assert_eq!(
+            with_decoder(
+                r###""decoder": {"type": "Sequence", "decoders": [{"type": "ByteLevel"},
+                    {"type": "WordPiece", "prefix": "##", "cleanup": false}]},"###
+            ),
+            "abcd hello ."
         );
     }
 

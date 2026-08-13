@@ -16,6 +16,28 @@ use std::collections::HashMap;
 /// HF's default when `model.max_input_chars_per_word` is absent.
 pub const DEFAULT_MAX_INPUT_CHARS_PER_WORD: usize = 100;
 
+/// tokenizer.json's `decoder` block when it is
+/// `{"type": "WordPiece", "prefix": "##", "cleanup": true}`.
+///
+/// Both fields matter and neither can be assumed. Measured on `tokenizers`
+/// 0.22.2 with the vocab `{ab, ##cd, hello, .}` decoding `[ab, ##cd, hello, .]`:
+///
+/// | decoder | result |
+/// |---|---|
+/// | absent | `"ab ##cd hello ."` |
+/// | `cleanup: true` | `"abcd hello."` |
+/// | `cleanup: false` | `"abcd hello ."` |
+///
+/// So the space join is what HF does with *no* decoder at all; this block adds
+/// the ` <prefix>` splice, and `cleanup` adds the punctuation tidy on top. A
+/// decoder-less WordPiece file must therefore keep its `##` markers and its
+/// space before the period — which is why this is `Option` on the tokenizer
+/// rather than a pair of defaults.
+pub struct WordPieceDecoder {
+    pub prefix: Box<str>,
+    pub cleanup: bool,
+}
+
 pub struct WordPiece {
     /// Pieces that may start a word (no continuing prefix).
     head: HashMap<Box<[u8]>, TokenId, FxBuildHasher>,

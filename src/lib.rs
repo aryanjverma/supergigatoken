@@ -260,7 +260,7 @@ impl BPETokenizer {
     fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         let ids = extract_token_ids(&tokens)?;
         let ids = ids.as_slice()?;
-        if let Some(text) = self.tokenizer.decode_wordpiece(ids, true) {
+        if let Some(text) = self.tokenizer.decode_wordpiece(ids) {
             return Ok(text.into_bytes());
         }
         Ok(self.tokenizer.decode(ids).collect())

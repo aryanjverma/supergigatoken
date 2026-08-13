@@ -32,6 +32,20 @@ def hub_server(gpt2_tokenizer_path):
     requests: list[tuple[str, str | None]] = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        # HTTP/1.1 with an accurate Content-Length on *every* response,
+        # including the 302's zero-length body.
+        #
+        # The default (HTTP/1.0, no length on the redirect) made this fixture
+        # fail intermittently — roughly two runs in three — with "Peer
+        # disconnected" on the CDN leg. Both legs are served from the same
+        # loopback host:port, so the client may keep the redirect's connection
+        # in its pool and reuse it for the CDN request; under HTTP/1.0 the
+        # server closes after each response, and whether the FIN landed before
+        # the reuse decided the run. A real Hub redirect points at a different
+        # host, so nothing in production reuses a connection across these two
+        # legs — the race belonged to the stand-in, not to the fetch code.
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self):
             requests.append((self.path, self.headers.get("Authorization")))
             if self.path == "/openai-community/gpt2/resolve/main/tokenizer_config.json":
@@ -48,6 +62,9 @@ def hub_server(gpt2_tokenizer_path):
                 self.send_response(302)
                 self.send_header("x-repo-commit", commit)
                 self.send_header("Location", "/cdn/tokenizer.json")
+                # Required under HTTP/1.1: without it the body length is
+                # undelimited and the connection cannot be safely reused.
+                self.send_header("Content-Length", "0")
                 self.end_headers()
             elif self.path == "/cdn/tokenizer.json":
                 self.send_response(200)

@@ -441,6 +441,11 @@ therefore still open, and unlike `superword_bounded` (15% of its path, capped at
 1.18×) this one has not been shown to be a small share of anything. Measure the
 share before building it.
 
+**Measured below: 61.6%.** See "Phase split" at the end of this addendum — and
+note that the arithmetic one is tempted to do from this table plus an end-to-end
+number (which gave ~45%) was wrong, because the two came from different
+processes.
+
 ### The materialised normalizer cost 2.6× of encode, and the plan said <1%
 
 The design predicted the materialised `BertNormalizer` pass would be "well under
@@ -537,3 +542,42 @@ registered in `sweep.py`'s `REPOS` for the next full sweep — this run was
 deliberately *not* merged into `results.json`, since folding rows measured under
 different conditions into a curated artifact would quietly break the comparison
 it exists to make.
+
+### Phase split: the walker is 61.6%, and that settles the SIMD question
+
+The section above left the walker's share open and warned that comparing a
+standalone criterion bench against an end-to-end Python measurement is
+cross-process inference. It was, and it was wrong: the arithmetic suggested ~45%.
+Measured properly — `bench_bert_phases`, four arms in **one process** over the
+same 33.5 MB / 6819 documents, min-of-5, because this box's background load
+moves absolute throughput ~25% between sessions while leaving in-run ratios
+intact:
+
+| arm | MB/s | share of encode |
+|---|---:|---:|
+| full encode | 219.3 | — |
+| normalize only | 1080.7 | 20.3% |
+| **pretokenize only** (on normalized text) | **356.3** | **61.6%** |
+| everything else (cache probe + MaxMatch + emit) | — | 18.1% |
+
+Shares are computed on time per byte, which composes; a ratio of throughputs
+does not.
+
+So the scalar `bert` walker is the dominant cost of BERT encoding, and the SIMD
+`MaskScheme` port is now justified rather than speculative. Ceilings: an
+infinitely fast walker gives **2.6×**, and a walker reaching the ~1 GB/s the
+normalizer's bulk scan manages would give **~1.7×**. Compare
+`superword_bounded`, which was declined at 15% of its path for a 1.18× ceiling —
+this is the opposite case.
+
+Two notes for whoever builds it. The walker measures 356.3 MB/s here against
+408.4 MiB/s in the criterion bench, because this arm feeds it *normalized* text
+(lowercased, accents stripped, CJK space-padded), which is what the real path
+produces and a different span distribution than raw OWT. And the boundaries are
+a pure per-byte class test with no long-skip structure, so the port is a
+shuffle-based table lookup in `mask.rs` terms, not a `memchr` hop.
+
+The normalizer work in the section above is not thereby wasted — 62.6% → 20.3%
+is what *moved* the bottleneck here — but it is finished. The remaining 18.1%
+covers the cache probe, MaxMatch, and lane emission together, which is the floor
+this engine already achieves for byte-level BPE.
