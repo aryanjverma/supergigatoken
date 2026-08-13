@@ -338,17 +338,10 @@ mod tests {
             .collect()
     }
 
-    /// Load the first `max_bytes` of ~/data/owt_train.txt, truncated to a
-    /// UTF-8 boundary (streamed; the full file is ~12 GB).
-    fn load_owt_prefix(max_bytes: usize) -> Vec<u8> {
-        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
-        let f = std::fs::File::open(&path).expect("Could not open ~/data/owt_train.txt");
-        let mut buf = Vec::with_capacity(max_bytes);
-        f.take(max_bytes as u64).read_to_end(&mut buf).unwrap();
-        while !buf.is_empty() && std::str::from_utf8(&buf).is_err() {
-            buf.pop();
-        }
-        buf
+    /// First `max_bytes` of ~/data/owt_train.txt, or None when the corpus
+    /// is absent (the shared loader reports the skip).
+    fn load_owt_prefix(max_bytes: usize) -> Option<Vec<u8>> {
+        crate::test_data::owt_prefix_or_skip(max_bytes)
     }
 
     #[test]
@@ -490,7 +483,7 @@ mod tests {
     #[test]
     fn qwen35_matches_regex_owt() {
         const SIZE: usize = 5_000_000;
-        let input = load_owt_prefix(SIZE);
+        let Some(input) = load_owt_prefix(SIZE) else { return };
         let text = std::str::from_utf8(&input).unwrap();
         eprintln!(
             "Testing qwen3.5 fast pretokenizer vs regex on {:.1} MB of OWT",

@@ -41,3 +41,26 @@ pub(crate) fn corpus_or_skip(rel: &str) -> Option<PathBuf> {
     }
     found
 }
+
+/// First `max_bytes` of `~/data/owt_train.txt`, truncated to a UTF-8 boundary,
+/// or None when the corpus is absent.
+///
+/// Streamed rather than read whole: the file is ~12 GB and every caller wants a
+/// prefix. Nine test modules had grown their own byte-identical copy of this,
+/// each `expect`ing the open — which is why a CI runner (no `~/data`) failed 11
+/// differentials at once with "No such file or directory" while this machine,
+/// which happens to have the corpus, passed. Absence is the only condition that
+/// skips: a read error on a corpus that *does* exist still panics.
+pub(crate) fn owt_prefix_or_skip(max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let path = corpus_or_skip("owt_train.txt")?;
+    let f = std::fs::File::open(&path).expect("opening a corpus that is present");
+    let mut buf = Vec::with_capacity(max_bytes.min(1 << 30));
+    f.take(max_bytes as u64).read_to_end(&mut buf).expect("reading owt_train.txt");
+    // Same trim as the copies this replaces: drop the trailing partial
+    // character so the slice is valid UTF-8, at most three pops.
+    while !buf.is_empty() && std::str::from_utf8(&buf).is_err() {
+        buf.pop();
+    }
+    Some(buf)
+}
