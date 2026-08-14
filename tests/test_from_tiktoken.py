@@ -1,3 +1,5 @@
+import shutil
+
 import pytest
 import tiktoken
 from conftest import tiktoken_vocab_path
@@ -185,7 +187,11 @@ def test_unnamed_vocab_needs_an_explicit_pretokenizer(tmp_path, r50k_tiktoken_pa
     """A rank file whose name is not a published encoding cannot be resolved,
     and says so instead of falling back to some default scheme."""
     unnamed = tmp_path / "custom.tiktoken"
-    unnamed.symlink_to(r50k_tiktoken_path)
+    # A copy, not a symlink: only the file *name* is under test, and creating a
+    # symlink on Windows needs SeCreateSymbolicLinkPrivilege, which an ordinary
+    # account does not hold (WinError 1314) — that failed the test for a reason
+    # unrelated to pretokenizer resolution.
+    shutil.copyfile(r50k_tiktoken_path, unnamed)
     with pytest.raises(ValueError, match="pretokenizer"):
         gigatoken.Tokenizer.from_tiktoken(unnamed)
     with pytest.raises(ValueError, match="unknown pretokenizer scheme"):

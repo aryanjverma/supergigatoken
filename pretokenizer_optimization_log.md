@@ -412,3 +412,172 @@ why they are the ones A/B decisions are made on: 33.5 MB on one core is a ~370 m
 measurement with no scheduler in the loop, and the `bench_superword_variants`
 arms are interleaved within one process on top of that. Quote the parallel figure
 for what a user gets; optimize against the single-threaded one.
+
+## Addendum: WordPiece / BERT
+
+Measurements taken while implementing `bpe::wordpiece` + `bpe::bert_normalizer`
+and the `bert` pretokenizer scheme. Box: the same Windows machine as the
+addendum above, single-threaded arms unless stated.
+
+### The `bert` walker: 408 MiB/s, and why the comparison flatters the others
+
+`cargo bench --bench pretokenize -- fast_scalar`, 100 MB of OWT, criterion
+10 samples:
+
+| scheme | throughput |
+|---|---:|
+| r50k (`fast_scalar`) | 1.794 GiB/s |
+| qwen2 | 1.409 GiB/s |
+| qwen3_5 | 1.391 GiB/s |
+| cl100k | 1.360 GiB/s |
+| **bert** | **408.4 MiB/s** |
+
+4.4× behind r50k, but the per-byte comparison is not apples to apples: this
+scheme *isolates every punctuation character*, so `"a...b"` is five pretokens
+where r50k's is two. A large part of the gap is spans emitted, not bytes walked,
+and span count is what the downstream cache probe pays for. The walker itself is
+one table load per byte with no SWAR skip — the SIMD `MaskScheme` port is
+therefore still open, and unlike `superword_bounded` (15% of its path, capped at
+1.18×) this one has not been shown to be a small share of anything. Measure the
+share before building it.
+
+**Measured below: 61.6%.** See "Phase split" at the end of this addendum — and
+note that the arithmetic one is tempted to do from this table plus an end-to-end
+number (which gave ~45%) was wrong, because the two came from different
+processes.
+
+### The materialised normalizer cost 2.6× of encode, and the plan said <1%
+
+The design predicted the materialised `BertNormalizer` pass would be "well under
+a percent" because "ASCII lowercase is a few GB/s against an encode path running
+at hundreds of MB/s". Measured on 32 MB of OWT (best of 5, single-threaded,
+32 × 1 MB documents, bert-base-uncased vocab with only the `normalizer` field
+varying):
+
+| arm | before | after | share of encode, before → after |
+|---|---:|---:|---:|
+| no normalizer | 271.0 | 262.5 | — |
+| clean_text only | 143.2 | 236.6 | 47.2% → 9.9% |
+| clean+cjk | 137.1 | 234.2 | 49.4% → 10.8% |
+| clean+cjk+lower | 110.5 | 217.4 | 59.2% → 17.2% |
+| clean+cjk+strip (NFD) | 109.9 | 193.7 | 59.5% → 26.2% |
+| **full (bert-base-uncased)** | **101.4** | **190.5** | **62.6% → 27.4%** |
+
+End-to-end encode went 101.4 → 190.5 MB/s, **1.88×**, for two changes that are
+the same idea applied twice.
+
+Two things the prediction missed, both of which only a decomposition by step
+could show:
+
+- **`clean_text` was 47% on its own** — six times the whole normalizer's
+  predicted budget — because it rebuilt the document char by char through
+  `chars()` + `String::push`, with a class-table load per character. NFD, the
+  step that *looks* expensive, was 0.2%.
+- **A whole-segment ASCII precheck buys nothing.** The first attempt gated the
+  fast path on "printable ASCII and no uppercase" over the entire segment. It
+  never fired: uppercase is in nearly every document, and once that was fixed,
+  *newlines* still disqualified every 1 MB OWT document. Throughput moved by
+  −6% (102.0 → 95.3), i.e. noise plus a wasted scan. The win only exists
+  per **run**: hop to the next byte outside 0x20–0x7E, bulk-copy everything
+  before it. That is the same scan `PrecompiledCharsmap::normalize_into` already
+  uses two modules over, for the same reason.
+
+The fold pass (drop `Mn`, lowercase) needed the identical treatment and gave the
+second half of the win: no ASCII char is `Mn`, so an ASCII run never triggers the
+filter and the case fold is a byte map. It cannot be skipped outright even when
+the clean pass already folded ASCII — NFD *creates* ASCII that never went through
+it (`"É"` → `"E"` + U+0301, and the `E` still needs folding) — but folding an
+already-folded byte is idempotent, so applying the map unconditionally is both
+correct and cheaper than tracking provenance.
+
+Both bulk paths rest on arguments about where an ASCII run can be treated as
+opaque (NFD neither decomposes nor reorders an ASCII starter; no ASCII char is
+`Mn`; `to_lowercase` maps ASCII to ASCII, so the steps commute with an ASCII case
+fold). Per this repo's convention those arguments are not the warrant —
+`bert_normalizer_matches_reference_random` is: it fuzzes the run-based
+implementation against a straightforward four-pass reference over 24 flag
+combinations and 400 rounds each, with input weighted 70% ASCII so the run
+boundaries are where the cases land.
+
+### What is left, and the lever that is still deferred
+
+At 27.4% the normalizer is still far above the design's ~1% trigger for the
+deferred **raw-keyed, normalize-on-miss** redesign, and this measurement is what
+that decision was waiting for. The remaining cost splits roughly: ICU NFD ~9%,
+the clean pass ~10%, the fold pass ~6%. The redesign's appeal is structural
+rather than incremental — normalization is the only stage that still runs over
+100% of input bytes, where the pretoken cache means MaxMatch runs on ~1% of
+pretokens — so its ceiling is the whole 27.4%. It also needs its own differential
+fuzz (the split points must provably come out the same), which is why it stays
+deferred here rather than being attempted alongside everything else.
+
+### Miss-path cost: LinMaxMatch is not indicated
+
+Cold vs warm passes over the same 32 MB in one process, normalizer stripped so the
+number isolates the encode engine: 212.7 MB/s on the first pass, 261.6 on the
+best later one — a 19% cold penalty that covers *everything* first-touch (pretoken
+cache inserts, token-arena growth, page faults), of which naive MaxMatch is only a
+part. On warm passes the miss path does not run at all. The LinMaxMatch trie
+(Song et al. 2021) therefore has a ceiling well under 19% on a cold corpus and
+~0% on a repeated one, against a naive backoff already bounded to
+`max_piece_len` probes per position (18 bytes for bert-base-uncased). Not built;
+build it only if a bench isolating the miss path contradicts this.
+
+### End-to-end, against HuggingFace
+
+`benchmarks/compare/measure.py`, bert-base-uncased, 100 MB of OWT, one fresh
+process per library, 8 cores:
+
+| library | MB/s | Mtok/s | wall |
+|---|---:|---:|---:|
+| gigatoken | **618.25** | 136.4 | 0.162 s |
+| HuggingFace `tokenizers` | 13.91 | 3.05 | 7.191 s |
+
+**44.4×.** The two rows report slightly different token counts (22.06M vs
+21.94M, 0.6%) because the harness hands gigatoken the slab as one document and
+HF a list split on the separator, which moves the boundaries at document edges;
+that asymmetry is how every existing row in `benchmarks/results.json` was
+measured too, so the figure is comparable within that table. The BERT repos are
+registered in `sweep.py`'s `REPOS` for the next full sweep — this run was
+deliberately *not* merged into `results.json`, since folding rows measured under
+different conditions into a curated artifact would quietly break the comparison
+it exists to make.
+
+### Phase split: the walker is 61.6%, and that settles the SIMD question
+
+The section above left the walker's share open and warned that comparing a
+standalone criterion bench against an end-to-end Python measurement is
+cross-process inference. It was, and it was wrong: the arithmetic suggested ~45%.
+Measured properly — `bench_bert_phases`, four arms in **one process** over the
+same 33.5 MB / 6819 documents, min-of-5, because this box's background load
+moves absolute throughput ~25% between sessions while leaving in-run ratios
+intact:
+
+| arm | MB/s | share of encode |
+|---|---:|---:|
+| full encode | 219.3 | — |
+| normalize only | 1080.7 | 20.3% |
+| **pretokenize only** (on normalized text) | **356.3** | **61.6%** |
+| everything else (cache probe + MaxMatch + emit) | — | 18.1% |
+
+Shares are computed on time per byte, which composes; a ratio of throughputs
+does not.
+
+So the scalar `bert` walker is the dominant cost of BERT encoding, and the SIMD
+`MaskScheme` port is now justified rather than speculative. Ceilings: an
+infinitely fast walker gives **2.6×**, and a walker reaching the ~1 GB/s the
+normalizer's bulk scan manages would give **~1.7×**. Compare
+`superword_bounded`, which was declined at 15% of its path for a 1.18× ceiling —
+this is the opposite case.
+
+Two notes for whoever builds it. The walker measures 356.3 MB/s here against
+408.4 MiB/s in the criterion bench, because this arm feeds it *normalized* text
+(lowercased, accents stripped, CJK space-padded), which is what the real path
+produces and a different span distribution than raw OWT. And the boundaries are
+a pure per-byte class test with no long-skip structure, so the port is a
+shuffle-based table lookup in `mask.rs` terms, not a `memchr` hop.
+
+The normalizer work in the section above is not thereby wasted — 62.6% → 20.3%
+is what *moved* the bottleneck here — but it is finished. The remaining 18.1%
+covers the cache probe, MaxMatch, and lane emission together, which is the floor
+this engine already achieves for byte-level BPE.

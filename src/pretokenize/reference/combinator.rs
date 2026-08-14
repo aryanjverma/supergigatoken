@@ -509,8 +509,12 @@ mod tests {
 
     #[test]
     fn combinator_compare() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let input = std::fs::read_to_string(data_dir.join("TinyStoriesV2-GPT4-valid.txt")).unwrap();
+        // Optional local corpus (never committed, never downloaded by a test):
+        // absent means "cannot check", not "combinator disagrees".
+        let Some(path) = crate::test_data::corpus_or_skip("TinyStoriesV2-GPT4-valid.txt") else {
+            return;
+        };
+        let input = std::fs::read_to_string(&path).expect("read TinyStoriesV2-GPT4-valid.txt");
         let input_bytes = input.as_bytes();
         let standard_iterator = crate::pretokenize::pretokenize_as_iter(input_bytes);
         let mut input_slice = input.as_str();

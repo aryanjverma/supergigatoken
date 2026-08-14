@@ -6,6 +6,8 @@ mod input;
 mod load_tokenizer;
 mod pretokenize;
 #[cfg(test)]
+mod test_data;
+#[cfg(test)]
 mod test_hub;
 mod token;
 

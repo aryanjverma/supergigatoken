@@ -39,9 +39,7 @@ def _assert_ids_match(hf_tok, gigatoken_tok, text: str):
     # other tokenizers, whose ByteLevel post-processors add nothing.
     hf_ids = hf_tok.encode(text, add_special_tokens=False).ids
     gigatoken_ids = gigatoken_tok.encode(text.encode("utf-8")).tolist()
-    assert gigatoken_ids == hf_ids, (
-        f"Mismatch for {text!r}:\n  HF:    {hf_ids}\n  gigatoken: {gigatoken_ids}"
-    )
+    assert gigatoken_ids == hf_ids, f"Mismatch for {text!r}:\n  HF:    {hf_ids}\n  gigatoken: {gigatoken_ids}"
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +63,7 @@ TEXTS = [
     "١٢٣٤٥ ٦٧",
     "def foo(x: int) -> int:\n    return x + 1\n",
     "import os\nos.path.join('a', 'b')",
-    'SELECT * FROM users WHERE id = 1;',
+    "SELECT * FROM users WHERE id = 1;",
     '{"key": "value", "num": 123, "arr": [1, 2, 3]}',
     "https://example.com/path?query=value&other=123#fragment",
     "\n",
@@ -143,6 +141,8 @@ def test_endoftext_id(spec, gigatoken_tok):
 
 @pytest.mark.parametrize("text", TEXTS + SPECIAL_TEXTS, ids=lambda t: repr(t)[:50])
 def test_decode_roundtrip(spec, gigatoken_tok, text):
+    if not spec.lossless_decode:
+        pytest.skip("WordPiece encoding is not invertible; see test_wordpiece.py")
     ids = gigatoken_tok.encode(text.encode("utf-8"))
     # An NFC-normalizing tokenizer roundtrips to the normalized form,
     # exactly like HF.
@@ -246,25 +246,20 @@ def test_owt_matches_hf(hf_tok, gigatoken_tok):
                         f"\nMISMATCH slab {slab_idx} doc {i} "
                         f"(byte ~{total_bytes + i * DOC_BYTES}):\n"
                         f"  lens: HF {len(h)} vs gigatoken {len(j)}, first diff at {d}\n"
-                        f"  HF:    ...{h[ctx_lo:d + 5]}\n"
-                        f"  gigatoken: ...{j[ctx_lo:d + 5]}\n"
+                        f"  HF:    ...{h[ctx_lo : d + 5]}\n"
+                        f"  gigatoken: ...{j[ctx_lo : d + 5]}\n"
                         f"  HF toks there: "
-                        f"{[hf_tok.decode([t]) for t in h[ctx_lo:d + 5]]!r}"
+                        f"{[hf_tok.decode([t]) for t in h[ctx_lo : d + 5]]!r}"
                     )
 
         total_bytes += len(slab)
         total_docs += len(docs)
         elapsed = time.time() - t0
         print(
-            f"slab {slab_idx}: {total_bytes / 1e9:.2f} GB, {total_docs} docs, "
-            f"{total_tokens / 1e6:.0f}M tokens, {mismatches} mismatches, "
-            f"{total_bytes / 1e6 / elapsed:.0f} MB/s",
+            f"slab {slab_idx}: {total_bytes / 1e9:.2f} GB, {total_docs} docs, {total_tokens / 1e6:.0f}M tokens, {mismatches} mismatches, {total_bytes / 1e6 / elapsed:.0f} MB/s",
             flush=True,
         )
         assert mismatches == 0, f"{mismatches} mismatching documents so far"
 
-    print(
-        f"\nDone: {total_bytes / 1e9:.2f} GB, {total_docs} docs, "
-        f"{total_tokens} tokens, all identical to HF."
-    )
+    print(f"\nDone: {total_bytes / 1e9:.2f} GB, {total_docs} docs, {total_tokens} tokens, all identical to HF.")
     assert total_docs > 0

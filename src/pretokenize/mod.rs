@@ -26,11 +26,15 @@ mod options;
 mod pretoken;
 pub(crate) mod pretokenize_traits;
 pub mod reference;
-mod unicode;
+// `pub(crate)`, not private: `bpe::bert_normalizer` classifies codepoints with
+// the same tables the `bert` pretokenizer scheme uses, and both halves of
+// `BertNormalizer` (clean_text's remove/space sets, strip_accents' Mn set) live
+// in one packed table so a char costs one load in either consumer.
+pub(crate) mod unicode;
 
 pub use fast::{
-    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
-    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    FastBertPretokenizer, FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer,
+    FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 pub use options::{FastPretokenizerDispatch, PretokenizerType};
 pub use reference::state_machine::PretokenizerIter;
@@ -708,16 +712,10 @@ mod test {
     const GPT2_REGEX: &str =
         r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
-    /// Load the first `max_bytes` of ~/data/owt_train.txt, truncated to a UTF-8 boundary.
-    fn load_owt(max_bytes: usize) -> Vec<u8> {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let all_bytes =
-            fs::read(data_dir.join("owt_train.txt")).expect("Could not read ~/data/owt_train.txt");
-        let mut end = max_bytes.min(all_bytes.len());
-        while end > 0 && std::str::from_utf8(&all_bytes[..end]).is_err() {
-            end -= 1;
-        }
-        all_bytes[..end].to_vec()
+    /// First `max_bytes` of ~/data/owt_train.txt, or None when the corpus is
+    /// absent (the shared loader reports the skip).
+    fn load_owt(max_bytes: usize) -> Option<Vec<u8>> {
+        crate::test_data::owt_prefix_or_skip(max_bytes)
     }
 
     /// `safe_split_ranges` must produce boundaries that no pretoken crosses,
@@ -725,7 +723,7 @@ mod test {
     /// concatenating must equal pretokenizing the whole input in one pass.
     #[test]
     fn test_safe_split_ranges_pretoken_equivalent() {
-        let input = load_owt(2_000_000);
+        let Some(input) = load_owt(2_000_000) else { return };
 
         let ranges = safe_split_ranges(&input, 10_000, &[]);
         assert!(ranges.len() > 100, "expected many splits, got {}", ranges.len());
@@ -843,7 +841,7 @@ mod test {
     #[test]
     fn test_pretokenizer_matches_regex_owt() {
         const SIZE: usize = 5_000_000;
-        let input = load_owt(SIZE);
+        let Some(input) = load_owt(SIZE) else { return };
         eprintln!(
             "Testing pretokenizer vs regex on {:.1} MB of OWT",
             input.len() as f64 / 1e6
@@ -897,8 +895,13 @@ mod test {
 
     #[test]
     fn test_pretokenizer_ts() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("TinyStoriesV2-GPT4-train.txt")).unwrap();
+        // TinyStories is an optional local corpus, not a committed fixture:
+        // report its absence and stop rather than failing, so a machine without
+        // the download still reads as "no corpus" and not "pretokenizer broken".
+        let Some(path) = crate::test_data::corpus_or_skip("TinyStoriesV2-GPT4-train.txt") else {
+            return;
+        };
+        let file_bytes = fs::read(&path).expect("read TinyStoriesV2-GPT4-train.txt");
 
         let pretokenized_counts = pretokenize_as_iter(&file_bytes).counts();
         eprintln!("Pretokenized {} unique tokens", pretokenized_counts.len());
@@ -913,9 +916,8 @@ mod test {
 
     #[test]
     fn test_pretokenizer_owt_length() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("owt_train.txt")).unwrap();
-
+        // The whole corpus, hence `usize::MAX`; skipped when it is absent.
+        let Some(file_bytes) = load_owt(usize::MAX) else { return };
         let pretokens_count = pretokenize_as_iter(&file_bytes).count();
         eprintln!("Pretokenized {pretokens_count} tokens");
     }
@@ -1008,6 +1010,11 @@ mod span_source_tests {
             crate::pretokenize::fast::FastSuperwordBoundedPretokenizer::new(b),
             "superword_bounded",
         );
+        check_source(
+            crate::pretokenize::fast::FastBertPretokenizer::new(b),
+            crate::pretokenize::fast::FastBertPretokenizer::new(b),
+            "bert",
+        );
     }
 
     /// Every scheme's chunked `fill_spans_keyed` must reproduce its
@@ -1054,6 +1061,7 @@ mod span_source_tests {
                 PretokenizerType::Kimi,
                 PretokenizerType::SuperBPEStage1,
                 PretokenizerType::SuperwordBounded,
+                PretokenizerType::Bert,
             ] {
                 check_source(pt.pretokenize(b), pt.pretokenize(b), "dispatch");
             }

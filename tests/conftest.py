@@ -147,6 +147,50 @@ def olmo3_tokenizer_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def bert_base_uncased_tokenizer_path() -> Path:
+    """Path to bert-base-uncased tokenizer.json in the HF cache.
+
+    WordPiece with `lowercase=true` and `strip_accents=null` (which HF resolves
+    to true), the reference case for the BERT pipeline."""
+    return _hf_tokenizer_json("google-bert/bert-base-uncased")
+
+
+@pytest.fixture(scope="session")
+def bert_hub_dir(bert_base_uncased_tokenizer_path) -> Path:
+    """bert-base-uncased snapshot directory with everything AutoTokenizer needs,
+    prefetched and pinned to the cached tokenizer.json's revision, so
+    transformers only ever reads locally (mirrors `gpt2_hub_dir`).
+
+    Needed because the special tokens and `token_type_ids` that
+    AutoTokenizer reports for BERT come from neither tokenizer.json nor
+    tokenizer_config.json (which holds only do_lower_case and
+    model_max_length) — transformers resolves the architecture from config.json
+    and takes them from BertTokenizerFast's class defaults."""
+    snapshot = bert_base_uncased_tokenizer_path.parent
+    for name in ("tokenizer_config.json", "config.json", "vocab.txt"):
+        _hf_file("google-bert/bert-base-uncased", name, revision=snapshot.name)
+    return snapshot
+
+
+@pytest.fixture(scope="session")
+def bert_base_cased_tokenizer_path() -> Path:
+    """Path to bert-base-cased tokenizer.json in the HF cache.
+
+    `strip_accents=null` with `lowercase=false`, so the null default resolves
+    the other way and accents survive."""
+    return _hf_tokenizer_json("google-bert/bert-base-cased")
+
+
+@pytest.fixture(scope="session")
+def bert_multilingual_tokenizer_path() -> Path:
+    """Path to bert-base-multilingual-cased tokenizer.json in the HF cache.
+
+    119k WordPiece vocab over 104 languages: CJK padding, non-Latin scripts,
+    and accents that are *not* stripped."""
+    return _hf_tokenizer_json("bert-base-multilingual-cased")
+
+
+@pytest.fixture(scope="session")
 def superbpe_128k_tokenizer_path() -> Path:
     """Path to the released SuperBPE 128k tokenizer.json in the HF cache.
 

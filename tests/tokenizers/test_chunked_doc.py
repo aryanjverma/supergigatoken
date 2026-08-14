@@ -32,9 +32,11 @@ def big_text() -> str:
 
 def test_whole_doc_parallel_matches_serial(gigatoken_tok, big_text, tmp_path):
     path = tmp_path / "doc.txt"
-    # Bytes, not write_text: on Windows the latter both encodes with the
-    # locale codec (cp1252 cannot represent the corpus) and translates "\n"
-    # to "\r\n", so the file would not be the text `serial` is measured on.
+    # Bytes, not write_text: the file must hold exactly the bytes `big_text` is
+    # compared against. Path.write_text uses the locale encoding (cp1252 on a
+    # default Windows install, which cannot represent most of OWT) and
+    # translates "\n" to os.linesep, either of which would make this a test of a
+    # different document than the serial side encodes.
     path.write_bytes(big_text.encode("utf-8"))
     parallel = gigatoken_tok.encode_files([str(path)])  # whole file = one doc
     serial = gigatoken_tok.encode(big_text)
@@ -56,6 +58,9 @@ def test_space_added_token_chunked_matches_serial(
     token_text = "<|multi word separator|>"
     token_id = 50257  # one past the GPT-2 vocab
 
+    # tokenizer.json is UTF-8 and GPT-2's byte-level alphabet puts codepoints
+    # in it whose UTF-8 bytes the locale encoding may reject, so both ends are
+    # explicit rather than locale-dependent.
     spec = json.loads(gpt2_tokenizer_path.read_text(encoding="utf-8"))
     spec["added_tokens"].append(
         {"id": token_id, "content": token_text, "special": True}

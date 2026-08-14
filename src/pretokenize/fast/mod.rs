@@ -11,6 +11,7 @@ pub(crate) mod level1;
 pub(crate) mod mask;
 pub(crate) mod o200k_family;
 
+pub mod bert;
 pub mod cl100k;
 pub mod deepseek_v3;
 pub mod kimi;
@@ -24,6 +25,7 @@ pub mod superbpe_stage1;
 pub mod superword;
 pub mod superword_bounded;
 
+pub use bert::FastBertPretokenizer;
 pub use cl100k::FastCl100kPretokenizer;
 pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
 pub use kimi::FastKimiPretokenizer;

@@ -799,11 +799,17 @@ mod tests {
     use itertools::Itertools;
     use std::cmp::min;
 
+    /// The TinyStories validation split, or None with a printed reason — the
+    /// corpus is an optional local download, so its absence must not read as a
+    /// scanner regression.
+    fn tinystories_valid() -> Option<String> {
+        let path = crate::test_data::corpus_or_skip("TinyStoriesV2-GPT4-valid.txt")?;
+        Some(std::fs::read_to_string(&path).expect("read TinyStoriesV2-GPT4-valid.txt"))
+    }
+
     #[test]
     fn count_matches_next() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let input =
-            std::fs::read_to_string(data_dir.join("TinyStoriesV2-GPT4-valid.txt")).unwrap();
+        let Some(input) = tinystories_valid() else { return };
         let input_bytes = input.as_bytes();
 
         let next_count = SimdPretokIter::new(input_bytes).fold(0usize, |c, _| c + 1);
@@ -816,9 +822,7 @@ mod tests {
 
     #[test]
     fn simd_matches_fast() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let input =
-            std::fs::read_to_string(data_dir.join("TinyStoriesV2-GPT4-valid.txt")).unwrap();
+        let Some(input) = tinystories_valid() else { return };
         let input_bytes = input.as_bytes();
 
         let standard = crate::pretokenize::pretokenize_as_iter(input_bytes);

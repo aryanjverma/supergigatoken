@@ -625,15 +625,8 @@ mod tests {
 
     #[test]
     fn fast_matches_state_machine_owt() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let all_bytes = std::fs::read(data_dir.join("owt_train.txt"))
-            .expect("Could not read ~/data/owt_train.txt");
-        let max = 5_000_000.min(all_bytes.len());
-        let mut end = max;
-        while end > 0 && std::str::from_utf8(&all_bytes[..end]).is_err() {
-            end -= 1;
-        }
-        let input = &all_bytes[..end];
+        let Some(all_bytes) = crate::test_data::owt_prefix_or_skip(5_000_000) else { return };
+        let input = &all_bytes[..];
 
         let mut sm = crate::pretokenize::PretokenizerIter::new(input);
         let mut fast = FastR50kPretokenizer::new(input);

@@ -23,6 +23,12 @@ class TokenizerSpec:
     eot_text: str  # the end-of-text special token
     eot_id: int
     normalizes_nfc: bool = False  # tokenizer.json declares an NFC normalizer
+    #: Decoding reproduces the input exactly. False for WordPiece: its
+    #: pretokenizer drops whitespace and its normalizer lowercases and strips
+    #: accents, so no decoder can invert an encode — HF's own WordPiece decoder
+    #: re-inserts spacing heuristically. Such specs skip the roundtrip test and
+    #: are covered by test_wordpiece.py instead.
+    lossless_decode: bool = True
 
 
 TOKENIZER_SPECS = {
@@ -52,6 +58,27 @@ TOKENIZER_SPECS = {
         TokenizerSpec(name="deepseek_v3", eot_text="<｜end▁of▁sentence｜>", eot_id=1),
         TokenizerSpec(name="deepseek_v4", eot_text="<｜end▁of▁sentence｜>", eot_id=1),
         TokenizerSpec(name="superbpe_128k", eot_text="<|endoftext|>", eot_id=128000),
+        # WordPiece. BERT has no end-of-text token; [SEP] is the closest
+        # equivalent and, like every added token, is matched atomically in the
+        # raw input, so the eot test still means something.
+        TokenizerSpec(
+            name="bert_base_uncased",
+            eot_text="[SEP]",
+            eot_id=102,
+            lossless_decode=False,
+        ),
+        TokenizerSpec(
+            name="bert_base_cased",
+            eot_text="[SEP]",
+            eot_id=102,
+            lossless_decode=False,
+        ),
+        TokenizerSpec(
+            name="bert_multilingual",
+            eot_text="[SEP]",
+            eot_id=102,
+            lossless_decode=False,
+        ),
     ]
 }
 

@@ -2,9 +2,9 @@
 
 <div align="center">
 
-**Fast Rust trainers for BPE *and* SuperBPE — and a fast encoder for both.**
+**A strict superset of [gigatoken](https://github.com/marcelroed/gigatoken): its GB/s encoder, extended to the model families it did not cover.**
 
-*Train a 50k tokenizer in seconds, a 50k SuperBPE in minutes, then encode at hundreds of MB/s: **8× faster SuperBPE training** than the original and **116× faster encoding** than HuggingFace `tokenizers`, on a SuperBPE that packs ~20% more text into every token.*
+*Everything gigatoken already does — 23 tokenizer families, up to 24.5 GB/s — plus two families it didn't: **SuperBPE**, with a trainer **8× faster than the original** and encoding **116× faster than HuggingFace `tokenizers`** at ~20% more text per token; and **WordPiece/BERT**, bit-identical to HuggingFace at **44×** its speed. Same `gigatoken` import name and CLI, so existing code keeps working.*
 
 ![supergigatoken vs the original SuperBPE](assets/superbpe_vs_original.png)
 
@@ -15,20 +15,43 @@ Same corpus slice, same vocabulary size, same transition point, same stage-1 reg
 
 ## What is Supergigatoken?
 
-**SuperBPE** ([Liu et al., 2025](https://arxiv.org/abs/2503.13423)) trains BPE in two stages: **stage 1** is ordinary whitespace-pretokenized BPE (subwords), and **stage 2** resumes training with the whitespace restriction lifted, learning *superwords* that bridge multiple words (e.g. `of the`, `in the United States`). Because one token can now cover several words, SuperBPE encodes the same text in meaningfully fewer tokens at the same vocabulary size.
+It is a fork of [**gigatoken**](https://github.com/marcelroed/gigatoken), which is where the underlying speed comes from — SIMD pretokenization, a tuned pretoken cache, GB/s subword encoding, and HuggingFace/tiktoken compatibility. Supergigatoken is a **strict superset**: it keeps the `gigatoken` import name and CLI, so existing gigatoken code keeps working unchanged, and the inherited subword path is untouched (its 23-family × 3-CPU throughput matrix lives in [`benchmarks/compare/SUBWORD_THROUGHPUT.md`](benchmarks/compare/SUBWORD_THROUGHPUT.md)).
 
-Supergigatoken trains and encodes both kinds of tokenizer natively, in Rust:
+**SuperBPE** ([Liu et al., 2025](https://arxiv.org/abs/2503.13423)) trains BPE in two stages: **stage 1** is ordinary whitespace-pretokenized BPE (subwords), and **stage 2** resumes training with the whitespace restriction lifted, learning *superwords* that bridge multiple words (e.g. `of the`, `in the United States`). Because one token can now cover several words, SuperBPE encodes the same text in meaningfully fewer tokens at the same vocabulary size. **WordPiece** is BERT's model: greedy longest-match-first against a vocabulary, with a whole-word `[UNK]` on any failure.
+
+What the fork adds is **two model families gigatoken could not load**, each reusing that same engine rather than standing up a second one:
+
+| | added here | inherited |
+|---|---|---|
+| **SuperBPE** | `train_superbpe`, the `Superword` two-level encoder, the `superbpe_stage1` / `superword_bounded` schemes, the eval suite | — |
+| **WordPiece (BERT)** | MaxMatch as a third arm of the pretoken-miss path, the `bert` scheme, `BertNormalizer` | pretoken cache, worker pool, PyO3 surface, padding/truncation |
+| **BPE / SentencePiece** | nothing — deliberately | `train_bpe`, the whole subword encoder |
 
 - **`train_bpe(...)`** — the ordinary BPE trainer, inherited from gigatoken and benchmarked here against HuggingFace for the first time: **3.8× faster than `BpeTrainer`** at a matched 50k vocab on the same corpus (2.8 s vs 10.4 s on 100 MB), and 500 MB trains in 7 s.
 - **`train_superbpe(...)`** — the two-stage trainer. **8.0× faster than the original SuperBPE implementation** at matched settings, and it does not run out of memory where that one does.
-- **one encoder for both** — gigatoken's GB/s subword path, plus a `Superword` two-level mode (added here) that recovers most of a cached tokenizer's speed once whitespace pretokenization has been lifted. It covers the tokenizer released with the paper as well as ones trained here. HuggingFace encodes SuperBPE slowly; tiktoken cannot represent it at all.
+- **one encoder for all of it** — gigatoken's GB/s subword path, plus a `Superword` two-level mode and a WordPiece arm (both added here). HuggingFace encodes SuperBPE slowly and WordPiece at 13.9 MB/s; tiktoken cannot represent either.
 - **an evaluation suite** under [`benchmarks/superbpe/`](benchmarks/superbpe/) — encoding efficiency, encoding throughput, trainer speed vs HuggingFace, and a trainer + vocabulary comparison against the original SuperBPE.
 
-Every number below is reproducible from that suite; each section names the script that emits it.
+Every number below is reproducible; each section names the script or test that emits it. `train_bpe` and the subword encoder come from gigatoken and are labelled as such wherever they appear.
 
-It is a fork of [**gigatoken**](https://github.com/marcelroed/gigatoken), which is where the underlying speed comes from — SIMD pretokenization, a tuned pretoken cache, GB/s subword encoding, and HuggingFace/tiktoken compatibility. Supergigatoken is a strict superset: it keeps the `gigatoken` import name and CLI, so existing gigatoken code keeps working unchanged. The inherited subword throughput matrix (23 tokenizer families × 3 CPUs) is reproduced in [`benchmarks/compare/SUBWORD_THROUGHPUT.md`](benchmarks/compare/SUBWORD_THROUGHPUT.md) rather than here. What the **fork** adds is the SuperBPE half: `train_superbpe`, the `Superword` encoder and loader, the `superbpe_stage1` and `superword_bounded` schemes, and the evaluation suite. `train_bpe` and the subword encoder come from gigatoken and are labelled as such wherever they appear below.
+## WordPiece (BERT)
 
-## Encoding
+![WordPiece (BERT) encoding](assets/wordpiece.png)
+
+`bert-base-uncased`, `bert-base-cased` and `bert-base-multilingual-cased` load and encode **bit-identically to HuggingFace `tokenizers` 0.22.2** at `add_special_tokens=False` — verified token-for-token, and over *every* Unicode scalar: `test_bert_matches_hf_for_every_codepoint` encodes all 1.1M through both libraries and compares IDs.
+
+It is a **model**, not a backend. MaxMatch is a third arm of `encode_pretoken_miss`, dispatched on an `Option` field exactly like the ranked-merge arm, so the pretoken cache, `batch.rs`'s worker pool and serial mirrors, the PyO3 surface and padding/truncation are all inherited unchanged — and the Python side needed no dispatch change at all.
+
+Two things worth knowing before you use it:
+
+- **Encoding is not invertible.** The pretokenizer drops whitespace and the normalizer folds case and strips accents, so no decoder can reconstruct the input. Decoding goes through HuggingFace's `WordPiece` decoder, whose ` ##` splice and punctuation `cleanup` are both read from the file's `decoder` block rather than assumed.
+- **`[CLS]`/`[SEP]` wrapping lives in `as_hf()`**, which matches `transformers` for whichever source you hand it: from a bare `tokenizer.json` it reports exactly what `PreTrainedTokenizerFast` does (no `pad_token`, no `token_type_ids` — that information is in neither tokenizer file), and from a `transformers` object it matches `AutoTokenizer` outright, padding included.
+
+Unigram (T5, XLM-R, ALBERT, mT5) is still unsupported, and there is no WordPiece trainer.
+
+Where the time goes is the right-hand panel above, measured in one process by `bench_bert_phases`: **pretokenize 61.6%, normalize 20.3%, cache + MaxMatch 18.1%**. The scalar `bert` walker is therefore the remaining lever, with a 2.6× ceiling — the opposite verdict to `superword_bounded` below, which was declined at 15% of its path. Getting there took undoing a mistake worth recording: the materialised normalizer first cost **62.6%** of encode, because `clean_text` rebuilt each document character by character. Bulk-copying runs of printable ASCII took it to 20.3%. A *whole-segment* ASCII precheck buys nothing — one newline disqualifies a 1 MB document — so the win only exists per run.
+
+## SuperBPE encoding
 
 ![SuperBPE encoding efficiency](assets/superbpe_efficiency.png)
 
@@ -205,7 +228,7 @@ The full matrix — 23 tokenizer families across 3 CPUs, with methodology and th
 list of which models map to which family — is generated into
 [`benchmarks/compare/SUBWORD_THROUGHPUT.md`](benchmarks/compare/SUBWORD_THROUGHPUT.md).
 Credit for those numbers belongs upstream; they are here only to say that
-adding SuperBPE cost the subword path nothing.
+adding SuperBPE and WordPiece cost the subword path nothing.
 
 
 ## FAQ
@@ -220,7 +243,7 @@ Fewer tokens, more work per byte. A subword tokenizer's speed comes from caching
 `"superbpe_stage1"` if you care about scripts that write vowels as combining marks, since the GPT-2 default excludes `\p{M}` and fragments them (measured: −44.75% bytes/token for Hindi at a 4k vocab). The default stays `"gpt2"` so previously published numbers keep reproducing.
 
 ### Q: I've found a mismatch or a slow case — is that expected?
-Probably not. For anything SuperBPE-specific (`train_superbpe`, the `Superword` encoder, the eval suite), open an issue here. For the underlying subword engine, upstream [gigatoken](https://github.com/marcelroed/gigatoken/issues) is the right place.
+Probably not. For anything this fork adds — SuperBPE (`train_superbpe`, the `Superword` encoder, the eval suite) or WordPiece (the `bert` scheme, `BertNormalizer`, MaxMatch) — open an issue here. For the underlying subword engine, upstream [gigatoken](https://github.com/marcelroed/gigatoken/issues) is the right place.
 
 ## Citation
 Supergigatoken builds on gigatoken (the fast encoder) and SuperBPE (the two-stage training method). If you use it in your research, please cite both:
@@ -251,14 +274,17 @@ Supergigatoken builds on gigatoken (the fast encoder) and SuperBPE (the two-stag
 * Byte-level BPE merges *fragments* of characters, so a merge's operands need not be whole characters — and a junction that decodes to nothing on the right is a real boundary whose next character is merely unknown, not an interior one. Deriving the threshold as if it were interior mis-encoded Arabic letter + comma on both the released 128k and the 50k artifact committed here (5 tokens in 16,007,082). Fixed by enumerating a truncated character's completions and gluing non-ASCII pairs outright; the remaining conservatism is one arm, where the *left* operand opens mid-character and no valid probe can be built, capping the release's threshold at 85956 against a semantic transition of 100164.
 * Stage-2 training is O(n) in unit length; training large vocabs on hundreds of MB is minutes-scale. Stage 2 uses line-bounded units, so a superword can never span a newline — the reason supergigatoken's output is *outcome*-comparable to the original SuperBPE rather than byte-identical in its merges.
 
-Inherited from gigatoken and unchanged here: WordPiece is unsupported, SentencePiece models are far less optimized than BPE ones, file sinks are missing from the native API, Python iteration pays ABI3 overhead, and Windows is lightly tested (prefer WSL for perf work — though the SuperBPE suite, including the reference-trainer comparison, does run natively on it).
+* **WordPiece**: the scalar `bert` walker is **61.6%** of encode (measured in one process by `bench_bert_phases`; arithmetic across two separate benches suggested ~45% and was wrong). Its SIMD `MaskScheme` port is justified at a 2.6× ceiling but not built. The normalizer's remaining 20.3% has a structural fix that is also deferred — it is the only stage still running over 100% of input bytes, where the pretoken cache means MaxMatch touches ~1% of pretokens.
+* **WordPiece**: HuggingFace's own Unicode predicates are several UCD versions behind ICU's, so the class tables carry three hardcoded staleness deltas — 143 codepoints for punctuation, 20 for `clean_text`, **494** for `strip_accents`. The populations are pinned in tests so bumping `icu` fails loudly rather than silently mis-encoding Bengali or Devanagari, but the deltas are measured against `tokenizers` 0.22.2 and will need re-measuring against a newer one.
+
+Inherited from gigatoken and unchanged here: SentencePiece models are far less optimized than BPE ones, file sinks are missing from the native API, Python iteration pays ABI3 overhead, and Windows is lightly tested (prefer WSL for perf work — though the SuperBPE suite, including the reference-trainer comparison, does run natively on it).
 
 ---
 
 <details>
 <summary>AI Use Disclosure</summary>
 
-The **SuperBPE extension** in this fork — the `train_superbpe` trainer, the `Superword` encoder and loader, and the `benchmarks/superbpe/` evaluation suite — was implemented with AI assistance.
+Both extensions in this fork were implemented with AI assistance: the **SuperBPE** half (the `train_superbpe` trainer, the `Superword` encoder and loader, the `benchmarks/superbpe/` evaluation suite) and the **WordPiece** half (the MaxMatch model, the `bert` scheme, `BertNormalizer`, and their test suites).
 
 The underlying **gigatoken** code base was largely written by hand (visible in its Git history), with AI assistance in its later stages for the user-facing API, compatibility breadth, porting SIMD strategies across AVX-512/AVX2/NEON, and final profiling work. See [upstream](https://github.com/marcelroed/gigatoken) for its own disclosure.
 </details>

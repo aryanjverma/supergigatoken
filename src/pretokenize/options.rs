@@ -1,7 +1,7 @@
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::fast::{
-    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastKimiPretokenizer,
-    FastNemotronPretokenizer, FastO200kPretokenizer, FastOlmo3Pretokenizer,
+    FastBertPretokenizer, FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer,
+    FastKimiPretokenizer, FastNemotronPretokenizer, FastO200kPretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
     FastSuperBPEStage1Pretokenizer, FastSuperwordBoundedPretokenizer, FastSuperwordPretokenizer,
 };
@@ -27,6 +27,10 @@ pub enum PretokenizerType {
     /// trailing-space bounds. Splits, unlike `Superword`, but never inside a
     /// word — so a superword may still span whitespace.
     SuperwordBounded,
+    /// HF's `BertPreTokenizer` (BERT/WordPiece family): split on whitespace
+    /// (dropping it), then isolate punctuation. Not a regex scheme, and the
+    /// only one whose spans do not partition the input.
+    Bert,
 }
 
 /// The three Split regexes of the DeepSeek V3/V4 pre_tokenizer Sequence, as
@@ -82,13 +86,16 @@ impl PretokenizerType {
             PretokenizerType::SuperwordBounded => FastPretokenizerDispatch::SuperwordBounded(
                 FastSuperwordBoundedPretokenizer::new(bytes),
             ),
+            PretokenizerType::Bert => {
+                FastPretokenizerDispatch::Bert(FastBertPretokenizer::new(bytes))
+            }
         }
     }
 
     /// The canonical name of each variant, in variant order — the
     /// identifiers `from_name` accepts (plus the aliases listed there).
     /// Error messages naming the valid schemes derive from this list.
-    pub const NAMES: [&'static str; 12] = [
+    pub const NAMES: [&'static str; 13] = [
         "gpt2",
         "gpt4",
         "qwen2",
@@ -101,6 +108,7 @@ impl PretokenizerType {
         "superbpe_stage1",
         "superword",
         "superword_bounded",
+        "bert",
     ];
 
     /// The scheme named by a lowercase identifier, as used by loaders whose
@@ -121,6 +129,7 @@ impl PretokenizerType {
             "superbpe_stage1" => PretokenizerType::SuperBPEStage1,
             "superword" => PretokenizerType::Superword,
             "superword_bounded" => PretokenizerType::SuperwordBounded,
+            "bert" => PretokenizerType::Bert,
             _ => return None,
         })
     }
@@ -138,6 +147,11 @@ impl PretokenizerType {
 
     /// Identify the scheme from the `Split` regex found in a HuggingFace
     /// `tokenizer.json` pre_tokenizer. Returns `None` for unknown patterns.
+    ///
+    /// [`PretokenizerType::Bert`] is deliberately absent: BERT's pre_tokenizer
+    /// is `{"type": "BertPreTokenizer"}`, carrying no regex at all, so it is
+    /// identified by kind name in `load_tokenizer::hf::detect_pretokenizer_type`
+    /// instead.
     pub fn from_split_regex(pattern: &str) -> Option<Self> {
         match pattern {
             r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+" => {
@@ -196,6 +210,7 @@ pub enum FastPretokenizerDispatch<'a> {
     SuperBPEStage1(FastSuperBPEStage1Pretokenizer<'a>),
     Superword(FastSuperwordPretokenizer<'a>),
     SuperwordBounded(FastSuperwordBoundedPretokenizer<'a>),
+    Bert(FastBertPretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -216,6 +231,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::SuperBPEStage1(it) => it.next(),
             FastPretokenizerDispatch::Superword(it) => it.next(),
             FastPretokenizerDispatch::SuperwordBounded(it) => it.next(),
+            FastPretokenizerDispatch::Bert(it) => it.next(),
         }
     }
 }
@@ -245,6 +261,7 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::SuperBPEStage1(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Superword(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::SuperwordBounded(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Bert(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
 }

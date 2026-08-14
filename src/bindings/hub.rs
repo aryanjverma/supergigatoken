@@ -2,7 +2,7 @@
 //! cache-or-download used by `gigatoken._load.hub`.
 
 use crate::load_tokenizer::hub;
-use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
@@ -24,7 +24,14 @@ pub fn hub_file(
         match err.downcast_ref::<hub::FetchError>() {
             Some(fetch @ hub::FetchError::NotFound { .. }) => PyFileNotFoundError::new_err(fetch.to_string()),
             Some(fetch @ hub::FetchError::Unauthorized { .. }) => PyPermissionError::new_err(fetch.to_string()),
-            None => err.into(),
+            // `{err:#}` rather than the default conversion: an eyre report
+            // Displays only its outermost context, so a failed fetch reached
+            // Python as "downloading tokenizer.json from Hub repo X" with the
+            // actual reason — which URL, which status, which IO error — dropped.
+            // That is the whole diagnostic value of the chain, and its absence
+            // made an intermittent CI failure in
+            // `test_tokenizer_from_repo_id_downloads_into_cache` un-triageable.
+            None => PyRuntimeError::new_err(format!("{err:#}")),
         }
     })
 }
