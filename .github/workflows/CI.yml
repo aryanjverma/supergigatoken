@@ -5,8 +5,10 @@
 #     in sonic-simd (via sonic-rs); big-endian is refused by
 #     src/pretokenize/mod.rs. Dropped: x86, armv7, s390x, ppc64le.
 #   - No macos-13 (retired public runner); macOS is aarch64 on macos-14.
-#   - aarch64 manylinux2014 cross needs CFLAGS_aarch64_unknown_linux_gnu
-#     =-D__ARM_ARCH=8 so ring's ASM builds (briansmith/ring#1728).
+#   - linux aarch64 uses manylinux_2_28: manylinux2014's GCC 4.8 cross
+#     cannot build simdutf (NEON intrinsics / C++11) or ring's ASM
+#     without workarounds. CFLAGS_aarch64 keeps ring safe if the image
+#     still omits __ARM_ARCH (briansmith/ring#1728).
 #   - fail-fast: false so one target cannot cancel the rest.
 name: CI
 
@@ -32,8 +34,10 @@ jobs:
         platform:
           - runner: ubuntu-22.04
             target: x86_64
+            manylinux: auto
           - runner: ubuntu-22.04
             target: aarch64
+            manylinux: "2_28"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,7 +49,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          manylinux: auto
+          manylinux: ${{ matrix.platform.manylinux }}
           before-script-linux: |
             export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
       - name: Upload wheels
