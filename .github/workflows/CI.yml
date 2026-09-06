@@ -5,10 +5,11 @@
 #     in sonic-simd (via sonic-rs); big-endian is refused by
 #     src/pretokenize/mod.rs. Dropped: x86, armv7, s390x, ppc64le.
 #   - No macos-13 (retired public runner); macOS is aarch64 on macos-14.
-#   - linux aarch64 uses manylinux_2_28: manylinux2014's GCC 4.8 cross
-#     cannot build simdutf (NEON intrinsics / C++11) or ring's ASM
-#     without workarounds. CFLAGS_aarch64 keeps ring safe if the image
-#     still omits __ARM_ARCH (briansmith/ring#1728).
+#   - linux aarch64 builds natively on ubuntu-24.04-arm with
+#     manylinux_2_28. Cross images (manylinux2014-cross / 2_28-cross)
+#     ship GCC too old for simdutf's NEON intrinsics (vld1q_u32_x2) and
+#     for ring's ASM without CFLAGS workarounds. Native aarch64 avoids
+#     both. CFLAGS_aarch64 kept as a no-op-safe belt for ring.
 #   - fail-fast: false so one target cannot cancel the rest.
 name: CI
 
@@ -35,7 +36,7 @@ jobs:
           - runner: ubuntu-22.04
             target: x86_64
             manylinux: auto
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04-arm
             target: aarch64
             manylinux: "2_28"
     steps:
